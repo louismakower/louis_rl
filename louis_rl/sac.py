@@ -1,19 +1,16 @@
 from __future__ import annotations
 
-from isaaclab.envs import ManagerBasedRLEnv
-from isaaclab.utils import configclass
-from dataclasses import MISSING
+from dataclasses import dataclass, MISSING
 import torch
 
 from rl_games.common.experience import VectorizedReplayBuffer
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
-from torch.utils.tensorboard import SummaryWriter
 
-from scripts.louis_rl.networks import Policy, Q
-from scripts.louis_rl.reward_normaliser import RewardNormalizer
-from scripts.louis_rl.base_runner import BaseRunner
-from scripts.louis_rl.her import HERCfg
-from scripts.louis_rl.terminal_obs_env import ReturnTerminalManagerBasedRLEnv
+from .networks import Policy, Q
+from .reward_normaliser import RewardNormalizer
+from .base_runner import BaseRunner
+from .her import HERCfg
+from .vec_env import VecEnv, Logger
 
 def _recurse_obs(item, fn):
     new_dict = {}
@@ -27,19 +24,20 @@ def _recurse_obs(item, fn):
 class SACRunner(BaseRunner):
     def __init__(
             self,
-            env: ReturnTerminalManagerBasedRLEnv,
+            env: VecEnv,
             cfg: SACRunnerCfg,
             log_dir: str,
+            writer: Logger,
     ):
         super().__init__(log_dir)
-        self._env: ReturnTerminalManagerBasedRLEnv = env
+        self._env: VecEnv = env
         self.cfg = cfg
         self.alpha = cfg.alpha_init
-        self.device = self._env.unwrapped.device
-        self.num_envs = self._env.unwrapped.num_envs
+        self.device = self._env.device
+        self.num_envs = self._env.num_envs
         self.env_arange = torch.arange(self.num_envs, device=self.device)
-        self.max_ep_len = self._env.unwrapped.max_episode_length
-        self.action_shape = self._env.unwrapped.single_action_space.shape[0]
+        self.max_ep_len = self._env.max_episode_length
+        self.action_shape = self._env.action_space.shape[0]
         self.target_entropy = -self.action_shape if self.cfg.target_entropy == "auto" else float(self.cfg.target_entropy)
         print(f"[SAC]: Target entropy set to {self.target_entropy}")
         if self.cfg.her_cfg:
@@ -48,12 +46,12 @@ class SACRunner(BaseRunner):
             self.her = None
         self._init_obs()
         self._init_networks()
-        self.writer = SummaryWriter(log_dir=log_dir)
+        self.writer = writer
         if self.cfg.reward_scaling:
             self.rew_norm = RewardNormalizer(
                 gamma=cfg.gamma,
                 G_max=cfg.reward_G_max,
-                device=self._env.unwrapped.device,
+                device=self._env.device,
             )
         self._print_UTD_ratio()
 
@@ -64,11 +62,11 @@ class SACRunner(BaseRunner):
         print(f"[INFO]: UTD ratio is currently: {utd:.3f}")
 
     def _init_obs(self):
-        self.policy_obs_dim = self._env.unwrapped.observation_space["policy"].shape[1]
-        goal_obs = self._env.unwrapped.observation_space.get("goal")
-        goal_obs_dim = sum(goal_obs.get(k).shape[1] for k in goal_obs) if goal_obs else 0
+        self.policy_obs_dim = self._env.observation_space["policy"].shape[0]
+        goal_obs = self._env.observation_space.get("goal")
+        goal_obs_dim = sum(goal_obs[k].shape[0] for k in goal_obs) if goal_obs else 0
         self.obs_shape = self.policy_obs_dim + goal_obs_dim
-        self.obs_norm = RunningMeanStd(insize=(self.obs_shape,)).to(self._env.unwrapped.device)
+        self.obs_norm = RunningMeanStd(insize=(self.obs_shape,)).to(self._env.device)
 
     def _set_eval(self):
         self.q1.network.eval()
@@ -97,7 +95,7 @@ class SACRunner(BaseRunner):
         obs_n = self.obs_norm(obs)
         mu, _ = self.policy.network(obs_n).chunk(2, dim=-1)
         return torch.tanh(mu)
-    
+
     def rollout_and_add_to_buffer(self, obs, ep_infos):
         self._set_eval()
         for step in range(self.cfg.steps_per_iter):
@@ -106,7 +104,7 @@ class SACRunner(BaseRunner):
                 action = (torch.rand(size=(obs_t.shape[0], self.action_shape), device=self.device) * 2) - 1
             else:
                 action = self.policy.dist(self.obs_norm(obs_t)).sample()
-            
+
             next_obs, ex_rew, term, timeout, extras = self._env.step(action)
             if self.her:
                 # make sure all her obs are shape (N, obs_dim)
@@ -119,10 +117,8 @@ class SACRunner(BaseRunner):
             # so we bootstrap off the correct obs, rather than an
             # uncorrelated random reset state
             resetted = term | timeout
-            next_obs_for_buffer = next_obs_t
-            if resetted.any():
-                with_goal = self.add_goal_obs(extras["terminal_obs"])
-                next_obs_for_buffer[extras["terminal_envs"]] = with_goal
+            terminal_t = self.add_goal_obs(extras["terminal_obs"])  # (N, obs_dim), nan for non-reset
+            next_obs_for_buffer = torch.where(resetted.unsqueeze(-1), terminal_t, next_obs_t)
 
             self.global_step += self.num_envs
 
@@ -146,15 +142,15 @@ class SACRunner(BaseRunner):
                     resetted=resetted,
                     extras=extras,
                 )
-        
+
 
             obs = next_obs
-        
+
         replay_buffer_state = self.buffer.capacity if self.buffer.full else self.buffer.idx
         self.writer.add_scalar("misc/replay_buffer_state", replay_buffer_state, self.global_step)
         ep_infos.append(extras.get("log", {}))
         return obs
-    
+
     def get_her_and_add_to_buffer(
             self,
             obs,
@@ -177,17 +173,16 @@ class SACRunner(BaseRunner):
         for key, val in obs["her"].items():
             self.her.her_obs_buf[key][ptr, self.env_arange] = val
 
-        # fill next_her_obs, using terminal_obs for resets
+        # fill next_her_obs: use terminal_obs for reset envs, next_obs for others
         for key, val in next_obs["her"].items():
-            self.her.her_obs_buf[f"next_{key}"][ptr, self.env_arange] = val
+            term_her = extras["terminal_obs"]["her"][key]  # (N, ...), nan for non-reset
+            next_her = val.clone()
             if resetted.any():
-                term_envs = extras["terminal_envs"]
-                term_her_obs = extras["terminal_obs"]["her"][key]
-                unsqueezed = term_her_obs.unsqueeze(-1) if term_her_obs.dim() == 1 else term_her_obs
-                self.her.her_obs_buf[f"next_{key}"][ptr[term_envs], term_envs] = unsqueezed
-            
+                next_her[resetted] = term_her[resetted]
+            self.her.her_obs_buf[f"next_{key}"][ptr, self.env_arange] = next_her
+
         if resetted.any():
-            term_envs = extras["terminal_envs"]  # (num_term,)
+            term_envs = resetted.nonzero(as_tuple=False).squeeze(-1)
             lengths = self.her.ep_ptr[term_envs] + 1  # (num_term,) +1: ep_ptr is 0-indexed
             max_len = lengths.max().item()
 
@@ -221,7 +216,7 @@ class SACRunner(BaseRunner):
             torch.zeros_like(self.her.ep_ptr),
             self.her.ep_ptr + 1,
         )
-    
+
     def train_batch(self, update_step):
         b_obs, b_act, b_extrns_rew, b_next_obs, b_dones = self.buffer.sample(self.cfg.batch_size)
         b_obs_n = self.obs_norm(b_obs)
@@ -241,7 +236,7 @@ class SACRunner(BaseRunner):
         self.writer.add_scalar("q_target/extrinsic_rew_scaled", b_extrns_rew_scaled.mean(), self.global_step)
         self.writer.add_scalar("q_target/extrinsic_rew_scaled_std", b_extrns_rew_scaled.std(), self.global_step)
         self.writer.add_scalar("critic/q_target", q_targ.mean(), self.global_step)
-        
+
         q_input = self._q_input(b_obs_n, b_act)
         q1_loss = self.q1.train_one_step(q_input, q_targ)
         q2_loss = self.q2.train_one_step(q_input, q_targ)
@@ -261,9 +256,6 @@ class SACRunner(BaseRunner):
 
     def learn(self):
         obs, extras = self._env.reset()
-        self._env.unwrapped.episode_length_buf = torch.randint_like(
-            self._env.unwrapped.episode_length_buf, high=int(self._env.unwrapped.max_episode_length)
-        )
         self.warmup = True
         ep_infos = []
         for train_step in range(self.cfg.max_steps // self.cfg.steps_per_iter):
@@ -283,7 +275,7 @@ class SACRunner(BaseRunner):
                 self._set_train()
                 for update_step in range(self.cfg.num_train_updates):
                     self.train_batch(update_step)
-                    
+
 
             if self.warmup and train_step % 10 == 0:
                 print(f"[SAC] Warming up, {self.global_step} out of {self.cfg.warmup_transitions} ({100*self.global_step / self.cfg.warmup_transitions:.1f}%)")
@@ -340,7 +332,7 @@ class SACRunner(BaseRunner):
 
             self.writer.add_scalar("q_target/log_prob", log_prob.mean(), self.global_step)
             self.writer.add_scalar("q_target/q", q.mean(), self.global_step)
-            
+
 
         return rew_scaled + self.cfg.gamma * (1 - dones.int()) * (q - self.alpha * log_prob)
 
@@ -382,7 +374,7 @@ class SACRunner(BaseRunner):
             out_size=1,
             lr=self.cfg.q_learning_rate,
             tau=self.cfg.q_tau,
-            device=self._env.unwrapped.device,
+            device=self._env.device,
             grad_clip_norm=self.cfg.q_grad_clip_norm,
         )
 
@@ -391,7 +383,7 @@ class SACRunner(BaseRunner):
                 obs_shape=[self.obs_shape],
                 action_shape=[self.action_shape],
                 capacity=self.cfg.replay_buffer_size,
-                device=self._env.unwrapped.device,
+                device=self._env.device,
             )
 
     def _init_policy(self):
@@ -402,7 +394,7 @@ class SACRunner(BaseRunner):
             hidden_dims=self.cfg.policy_hidden_dims,
             action_shape=self.action_shape,
             lr=self.cfg.policy_learning_rate,
-            device=self._env.unwrapped.device,
+            device=self._env.device,
             alpha_init=self.alpha,
             alpha_lr=self.cfg.alpha_lr,
             target_entropy=self.target_entropy,
@@ -413,10 +405,8 @@ class SACRunner(BaseRunner):
         return torch.cat([obs, act], dim=-1)
 
 
-@configclass
+@dataclass
 class SACRunnerCfg:
-    algo_name: str = "sac"
-
     # MDP
     gamma: float = MISSING
     alpha_init: float = MISSING
@@ -457,3 +447,4 @@ class SACRunnerCfg:
     collect_states: bool = MISSING
 
     her_cfg: HERCfg | None = None
+    algo_name: str = "sac"

@@ -1,29 +1,28 @@
 from __future__ import annotations
-from isaaclab.envs import ManagerBasedRLEnv
-from isaaclab.utils import configclass
+from dataclasses import dataclass, MISSING
 import torch
 from torch.distributions import MultivariateNormal
 import torch.nn as nn
 from torch import optim
-from torch.utils.tensorboard import SummaryWriter
-from dataclasses import MISSING
 
-from scripts.louis_rl.base_runner import BaseRunner
+from .base_runner import BaseRunner
+from .vec_env import VecEnv, Logger
 
 
 class PPORunner(BaseRunner):
     def __init__(
             self,
-            env: ManagerBasedRLEnv,
+            env: VecEnv,
             cfg: PPORunnerCfg,
             log_dir: str,
+            writer: Logger,
     ):
         super().__init__(log_dir)
         self._env = env
-        self.device = self._env.unwrapped.device
-        self.num_envs = self._env.unwrapped.num_envs
+        self.device = self._env.device
+        self.num_envs = self._env.num_envs
         self.cfg = cfg
-        self.act_dim = self._env.unwrapped.single_action_space.shape[0]
+        self.act_dim = self._env.action_space.shape[0]
         self._init_obs()
         self._init_networks()
         self.rew_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, device=self.device)
@@ -34,16 +33,16 @@ class PPORunner(BaseRunner):
         self.timeout_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, dtype=torch.bool, device=self.device)
         self.log_prob_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, device=self.device)
         self.V_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, device=self.device)
-        self.writer = SummaryWriter(log_dir=log_dir)
-        
+        self.writer = writer
+
         self.cov_mat = torch.diag(
             torch.full(size=(self.act_dim,), fill_value=0.5),
         ).to(device=self.device)
 
     def _init_obs(self):
-        self.policy_obs_dim = self._env.unwrapped.observation_space["policy"].shape[1]
-        goal_obs = self._env.unwrapped.observation_space.get("goal")
-        goal_obs_dim = sum(goal_obs.get(k).shape[1] for k in goal_obs) if goal_obs else 0
+        self.policy_obs_dim = self._env.observation_space["policy"].shape[0]
+        goal_obs = self._env.observation_space.get("goal")
+        goal_obs_dim = sum(goal_obs[k].shape[0] for k in goal_obs) if goal_obs else 0
         self.obs_shape = self.policy_obs_dim + goal_obs_dim
 
     def _init_networks(self):
@@ -67,9 +66,6 @@ class PPORunner(BaseRunner):
 
     def learn(self):
         obs, extras = self._env.reset()
-        self._env.unwrapped.episode_length_buf = torch.randint_like(
-            self._env.unwrapped.episode_length_buf, high=int(self._env.unwrapped.max_episode_length)
-        )
         step = 0
         for iteration_idx in range(self.cfg.num_iterations):
             next_obs, step, ep_infos = self.rollout(obs, step)
@@ -193,9 +189,8 @@ class PPORunner(BaseRunner):
         return obs, step, ep_infos
 
 
-@configclass
+@dataclass
 class PPORunnerCfg:
-    algo_name: str = "ppo"
     experiment_name: str = MISSING
 
     num_iterations: int = MISSING
@@ -211,3 +206,4 @@ class PPORunnerCfg:
     eps: float = MISSING
 
     save_interval: int = MISSING
+    algo_name: str = "ppo"

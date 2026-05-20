@@ -3,19 +3,19 @@ import torch.nn as nn
 import torch.optim as optim
 import torch
 
-from isaaclab.utils import configclass
-from dataclasses import MISSING
-from isaaclab.envs import ManagerBasedRLEnv
+from dataclasses import dataclass, MISSING
 
 from rl_games.common.experience import VectorizedReplayBuffer
 
+from .vec_env import VecEnv
+
 
 class RND:
-    def __init__(self, cfg: RNDCfg, env: ManagerBasedRLEnv):
-        self._env: ManagerBasedRLEnv = env
+    def __init__(self, cfg: RNDCfg, env: VecEnv):
+        self._env: VecEnv = env
         self.cfg: RNDCfg = cfg
-        self.device = env.unwrapped.device
-        self.obs_dim = self._env.unwrapped.observation_space["rnd"].shape[1]  # need to get the "rnd" obs shape
+        self.device = env.device
+        self.obs_dim = self._env.observation_space["rnd"].shape[0]
         self.pred_shape = self.cfg.pred_shape
         self._init_networks()
         self.loss = nn.MSELoss(reduction='none')
@@ -46,7 +46,7 @@ class RND:
         self.recent_loss = self.loss(pred, target)
         self.fresh_loss = True
         return self.recent_loss.detach().mean(dim=-1, keepdim=True)  # average over prediction dimension
-    
+
     def train(self):
         if not self.fresh_loss:
             raise RuntimeError("Loss is stale, please call get_intrinsic_rew first")
@@ -57,7 +57,7 @@ class RND:
         self.optim.step()
         return mean_loss.item()
 
-@configclass
+@dataclass
 class RNDCfg:
     pred_shape: int = MISSING
     target_hidden_layers: list[int] = MISSING
@@ -69,7 +69,7 @@ class IntrinsicBuffer(VectorizedReplayBuffer):
     def __init__(self, obs_shape, action_shape, intrns_obs_shape, capacity, device):
         super().__init__(obs_shape, action_shape, capacity, device)
         self.intrns_obs = torch.empty((capacity, *intrns_obs_shape), dtype=torch.float32, device=self.device)
-    
+
     def add(self, obs, action, reward, next_obs, done, intrns_obs):
         super().add(obs, action, reward, next_obs, done)
 
@@ -82,7 +82,7 @@ class IntrinsicBuffer(VectorizedReplayBuffer):
 
     def sample(self, batch_size):
         idxs = torch.randint(0,
-                            self.capacity if self.full else self.idx, 
+                            self.capacity if self.full else self.idx,
                             (batch_size,), device=self.device)
         obses = self.obses[idxs]
         actions = self.actions[idxs]

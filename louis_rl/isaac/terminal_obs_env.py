@@ -3,24 +3,16 @@ import torch
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.envs import VecEnvStepReturn
 
-def _slice(item, env_ids):
+
+def _fill_nan(item, mask):
     if isinstance(item, dict):
-        new_dict = {}
-        for k, v in item.items():
-            new_dict[k] = _slice(v, env_ids)
-        return new_dict
-    elif isinstance(item, torch.Tensor):
-        return item[env_ids]
-    else:
-        raise ValueError("expected dict or tensor")
-    
+        return {k: _fill_nan(v, mask) for k, v in item.items()}
+    t = item.clone().float()
+    t[mask] = float("nan")
+    return t
+
 
 class ReturnTerminalManagerBasedRLEnv(ManagerBasedRLEnv):
-    def collect_pre_reset_obs(self, reset_env_ids):
-        obs = self.observation_manager.compute()
-        return _slice(obs, reset_env_ids)
-
-
     def step(self, action: torch.Tensor) -> VecEnvStepReturn:
         """Execute one time-step of the environment's dynamics and reset terminated environments.
 
@@ -83,13 +75,15 @@ class ReturnTerminalManagerBasedRLEnv(ManagerBasedRLEnv):
             self.obs_buf = self.observation_manager.compute()
             self.recorder_manager.record_post_step()
 
-        # -- reset envs that terminated/timed-out and log the episode information
+        # -- compute pre-reset obs for ALL envs, nan out non-reset rows
         reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+        all_pre_reset = self.observation_manager.compute()
+        non_reset = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
         if len(reset_env_ids) > 0:
-            # collect observations before reset
-            self.extras["terminal_obs"] = self.collect_pre_reset_obs(reset_env_ids)
-            self.extras["terminal_envs"] = reset_env_ids
+            non_reset[reset_env_ids] = False
+        self.extras["terminal_obs"] = _fill_nan(all_pre_reset, non_reset)
 
+        if len(reset_env_ids) > 0:
             # trigger recorder terms for pre-reset calls
             self.recorder_manager.record_pre_reset(reset_env_ids)
 
