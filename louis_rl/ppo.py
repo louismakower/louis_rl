@@ -45,21 +45,17 @@ class PPORunner(BaseRunner):
         goal_obs_dim = sum(goal_obs[k].shape[0] for k in goal_obs) if goal_obs else 0
         self.obs_shape = self.policy_obs_dim + goal_obs_dim
 
+    def _build_mlp(self, in_dim: int, out_dim: int, hidden_dims: list[int]) -> nn.Sequential:
+        dims = [in_dim] + hidden_dims
+        layers = []
+        for i in range(len(dims) - 1):
+            layers += [nn.Linear(dims[i], dims[i + 1]), nn.GELU()]
+        layers.append(nn.Linear(dims[-1], out_dim))
+        return nn.Sequential(*layers)
+
     def _init_networks(self):
-        self.policy = nn.Sequential(
-            nn.Linear(self.obs_shape, 128),
-            nn.GELU(),
-            nn.Linear(128, 128),
-            nn.GELU(),
-            nn.Linear(128, self.act_dim)
-        ).to(self.device)
-        self.v = nn.Sequential(
-            nn.Linear(self.obs_shape, 128),
-            nn.GELU(),
-            nn.Linear(128, 128),
-            nn.GELU(),
-            nn.Linear(128, 1)
-        ).to(self.device)
+        self.policy = self._build_mlp(self.obs_shape, self.act_dim, self.cfg.policy_hidden_dims).to(self.device)
+        self.v = self._build_mlp(self.obs_shape, 1, self.cfg.v_hidden_dims).to(self.device)
         self.policy_optim = optim.AdamW(self.policy.parameters(), lr=self.cfg.policy_lr)
         self.v_optim = optim.AdamW(self.v.parameters(), lr=self.cfg.v_lr)
         self.mse = nn.MSELoss()
@@ -201,6 +197,9 @@ class PPORunnerCfg:
 
     policy_lr: float = MISSING
     v_lr: float = MISSING
+
+    policy_hidden_dims: list[int] = MISSING
+    v_hidden_dims: list[int] = MISSING
 
     gamma: float = MISSING
     eps: float = MISSING
