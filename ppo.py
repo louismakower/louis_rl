@@ -1,0 +1,213 @@
+from __future__ import annotations
+from isaaclab.envs import ManagerBasedRLEnv
+from isaaclab.utils import configclass
+import torch
+from torch.distributions import MultivariateNormal
+import torch.nn as nn
+from torch import optim
+from torch.utils.tensorboard import SummaryWriter
+from dataclasses import MISSING
+
+from scripts.louis_rl.base_runner import BaseRunner
+
+
+class PPORunner(BaseRunner):
+    def __init__(
+            self,
+            env: ManagerBasedRLEnv,
+            cfg: PPORunnerCfg,
+            log_dir: str,
+    ):
+        super().__init__(log_dir)
+        self._env = env
+        self.device = self._env.unwrapped.device
+        self.num_envs = self._env.unwrapped.num_envs
+        self.cfg = cfg
+        self.act_dim = self._env.unwrapped.single_action_space.shape[0]
+        self._init_obs()
+        self._init_networks()
+        self.rew_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, device=self.device)
+        self.act_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, self.act_dim, device=self.device)
+        self.obs_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, self.obs_shape, device=self.device)
+        self.next_obs_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, self.obs_shape, device=self.device)
+        self.term_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, dtype=torch.bool, device=self.device)
+        self.timeout_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, dtype=torch.bool, device=self.device)
+        self.log_prob_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, device=self.device)
+        self.V_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, device=self.device)
+        self.writer = SummaryWriter(log_dir=log_dir)
+        
+        self.cov_mat = torch.diag(
+            torch.full(size=(self.act_dim,), fill_value=0.5),
+        ).to(device=self.device)
+
+    def _init_obs(self):
+        self.policy_obs_dim = self._env.unwrapped.observation_space["policy"].shape[1]
+        goal_obs = self._env.unwrapped.observation_space.get("goal")
+        goal_obs_dim = sum(goal_obs.get(k).shape[1] for k in goal_obs) if goal_obs else 0
+        self.obs_shape = self.policy_obs_dim + goal_obs_dim
+
+    def _init_networks(self):
+        self.policy = nn.Sequential(
+            nn.Linear(self.obs_shape, 128),
+            nn.GELU(),
+            nn.Linear(128, 128),
+            nn.GELU(),
+            nn.Linear(128, self.act_dim)
+        ).to(self.device)
+        self.v = nn.Sequential(
+            nn.Linear(self.obs_shape, 128),
+            nn.GELU(),
+            nn.Linear(128, 128),
+            nn.GELU(),
+            nn.Linear(128, 1)
+        ).to(self.device)
+        self.policy_optim = optim.AdamW(self.policy.parameters(), lr=self.cfg.policy_lr)
+        self.v_optim = optim.AdamW(self.v.parameters(), lr=self.cfg.v_lr)
+        self.mse = nn.MSELoss()
+
+    def learn(self):
+        obs, extras = self._env.reset()
+        self._env.unwrapped.episode_length_buf = torch.randint_like(
+            self._env.unwrapped.episode_length_buf, high=int(self._env.unwrapped.max_episode_length)
+        )
+        step = 0
+        for iteration_idx in range(self.cfg.num_iterations):
+            next_obs, step, ep_infos = self.rollout(obs, step)
+            with torch.no_grad():
+                rtg = self.calc_rtg()  # (N, L)
+                advantages = self.calc_adv(rtg).detach()  # (N, L)
+            for _ in range(self.cfg.num_policy_grad_steps):
+                policy_loss = self.policy_step(advantages)
+            self.writer.add_scalar("policy/policy_loss", policy_loss, self.global_step)
+            for _ in range(self.cfg.num_v_grad_steps):
+                v_loss = self.value_step(rtg)
+            self.writer.add_scalar("value/v_loss", v_loss, self.global_step)
+            all_keys = set(k for d in ep_infos for k in d)
+            for key in all_keys:
+                vals = [d[key] for d in ep_infos if key in d]
+                mean_val = sum(float(v) for v in vals) / len(vals)
+                self.writer.add_scalar(key, mean_val, self.global_step)
+            obs = next_obs
+            if (iteration_idx + 1) % self.cfg.save_interval == 0:
+                self.save_checkpoint()
+
+    def _get_checkpoint(self) -> dict:
+        return {"policy": self.policy.state_dict()}
+
+    def _load_checkpoint(self, state: dict):
+        self.policy.load_state_dict(state["policy"])
+
+    def get_deterministic_action(self, obs):
+        self.policy.eval()
+        obs = self.add_goal_obs(obs)
+        return self.policy(obs)
+
+    def get_log_prob(self, obs, act):
+        mean = self.policy(obs)
+        dist = MultivariateNormal(mean, self.cov_mat)
+        log_prob = dist.log_prob(act)
+        return log_prob
+
+    def policy_step(self, advantages):
+        old_log_prob = self.log_prob_buf.detach()  # (N, L)
+        curr_log_prob = self.get_log_prob(self.obs_buf, self.act_buf)  # (N, L)
+        ratio = torch.exp(curr_log_prob - old_log_prob)  # (N, L)
+        surr_1 = ratio * advantages  # (N, L)
+        surr_2 = torch.clamp(ratio, 1-self.cfg.eps, 1+self.cfg.eps) * advantages
+        loss = -torch.min(surr_1, surr_2).mean()
+
+        self.policy_optim.zero_grad()
+        loss.backward()
+        self.policy_optim.step()
+        return loss.item()
+
+    def value_step(self, rtg):
+        v = self.v(self.obs_buf).squeeze(-1)
+        loss = self.mse(v, rtg.detach())
+
+        self.v_optim.zero_grad()
+        loss.backward()
+        self.v_optim.step()
+        return loss.item()
+
+    def calc_adv(self, rtg):
+        val = self.v(self.obs_buf).squeeze(-1)  # (N, L)
+        return rtg - val
+
+    def calc_rtg(self):
+        rtgs = torch.zeros_like(self.rew_buf)
+        for step_idx in range(self.rew_buf.shape[1]-1, -1, -1):
+            next_obs = self.next_obs_buf[:, step_idx]
+
+            rew = self.rew_buf[:, step_idx]
+
+            if step_idx == self.rew_buf.shape[1]-1:
+                # bootstrap next reward if not terminated
+                with torch.no_grad():
+                    bootstrap_val = self.v(next_obs).squeeze(-1)  # (N,)
+                    discounted_rew = torch.where(self.timeout_buf[:, step_idx], self.V_buf[:, step_idx], bootstrap_val)
+            else:
+                # use RTG from next timestep or bootstrap if timeout
+                # (i.e. use the value of the last state we have)
+                discounted_rew = torch.where(self.timeout_buf[:, step_idx], self.V_buf[:, step_idx], rtgs[:, step_idx+1])
+
+            # no discounted reward if terminated
+            discounted_rew = torch.where(self.term_buf[:, step_idx], 0, discounted_rew)
+            rtgs[:, step_idx] = rew + self.cfg.gamma*discounted_rew
+
+        return rtgs
+
+    def get_action(self, obs):
+        mean = self.policy(obs)
+        dist = MultivariateNormal(mean, self.cov_mat)
+        action = dist.sample()
+        log_prob = dist.log_prob(action)
+        return action, log_prob
+
+    def rollout(self, obs, step):
+        ep_infos = []
+        if isinstance(obs, dict):
+            obs = self.add_goal_obs(obs)
+        for step_idx in range(self.cfg.steps_per_rollout):
+            with torch.no_grad():
+                act, log_prob = self.get_action(obs)
+            next_obs, rew, term, timeout, extras = self._env.step(act)
+            self.global_step += self.num_envs
+            next_obs = self.add_goal_obs(next_obs)
+
+            self.obs_buf[:, step_idx] = obs
+            self.next_obs_buf[:, step_idx] = next_obs
+            self.rew_buf[:, step_idx] = rew
+            self.term_buf[:, step_idx] = term
+            self.timeout_buf[:, step_idx] = timeout
+            self.log_prob_buf[:, step_idx] = log_prob
+            self.act_buf[:, step_idx] = act
+            with torch.no_grad():
+                self.V_buf[:, step_idx] = self.v(obs).squeeze(-1)
+            obs = next_obs
+
+            self.writer.add_scalar("rewards/mean", rew.mean().item(), self.global_step)
+            ep_infos.append(extras.get("log", {}))
+            step += 1
+
+        return obs, step, ep_infos
+
+
+@configclass
+class PPORunnerCfg:
+    algo_name: str = "ppo"
+    experiment_name: str = MISSING
+
+    num_iterations: int = MISSING
+    steps_per_rollout: int = MISSING
+
+    num_policy_grad_steps: int = MISSING
+    num_v_grad_steps: int = MISSING
+
+    policy_lr: float = MISSING
+    v_lr: float = MISSING
+
+    gamma: float = MISSING
+    eps: float = MISSING
+
+    save_interval: int = MISSING
