@@ -181,7 +181,7 @@ class SACRunner(BaseRunner):
             next_her = val.clone()
             if resetted.any():
                 next_her[resetted] = term_her[resetted]
-            self.her.her_obs_buf[f"next_{key}"][ptr, self.env_arange] = next_her
+            self.her.her_next_obs_buf[key][ptr, self.env_arange] = next_her
 
         if resetted.any():
             term_envs = resetted.nonzero(as_tuple=False).squeeze(-1)
@@ -194,6 +194,7 @@ class SACRunner(BaseRunner):
                 "next_obs": self.her.trajectories["next_obs"][:max_len, term_envs],
                 "term": self.her.trajectories["term"][:max_len, term_envs],
                 "her_obs": {k: self.her.her_obs_buf[k][:max_len, term_envs] for k in self.her.her_obs_buf},
+                "her_next_obs": {k: self.her.her_next_obs_buf[k][:max_len, term_envs] for k in self.her.her_next_obs_buf},
                 "lengths": lengths,
             }
 
@@ -359,12 +360,13 @@ class SACRunner(BaseRunner):
 
     def _init_her_obs_buf(self, her_obs):
         self.her.her_obs_buf = {}
+        self.her.her_next_obs_buf = {}
         for key, val in her_obs.items():
             shape = val.shape[1:]
             self.her.her_obs_buf[key] = torch.zeros(
                 self.max_ep_len, self.num_envs, *shape, device=self.device, dtype=val.dtype
             )
-            self.her.her_obs_buf[f"next_{key}"] = torch.zeros(
+            self.her.her_next_obs_buf[key] = torch.zeros(
                 self.max_ep_len, self.num_envs, *shape, device=self.device, dtype=val.dtype
             )
 
