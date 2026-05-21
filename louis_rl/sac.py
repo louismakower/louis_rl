@@ -45,6 +45,8 @@ class SACRunner(BaseRunner):
         else:
             self.her = None
         self._init_obs()
+        if self.her is not None:
+            self.her.policy_obs_dim = self.policy_obs_dim
         self._init_networks()
         self.writer = writer
         if self.cfg.reward_scaling:
