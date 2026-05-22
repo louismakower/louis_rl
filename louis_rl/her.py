@@ -1,5 +1,6 @@
 from __future__ import annotations
 import torch
+from dataclasses import dataclass
 
 
 def build_hindsight_goals(
@@ -26,9 +27,11 @@ def build_hindsight_goals(
     else:
         raise ValueError(f"Unknown HER mode: {mode!r}. Expected 'final' or 'future'.")
 
-
+@dataclass
 class HERCfg:
-    def __init__(self):
+    k: int = 1
+
+    def __post_init__(self):
         self.policy_obs_dim: int | None = None  # set by SACRunner after env construction
 
     def get_hindsight_transitions(self, trajectories: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:

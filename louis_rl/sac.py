@@ -201,14 +201,15 @@ class SACRunner(BaseRunner):
             t_idx = torch.arange(max_len, device=self.device).unsqueeze(1)  # (max_len, 1)
             sliced["valid"] = (t_idx < lengths.unsqueeze(0)).reshape(-1)    # (max_len * num_term,)
 
-            new_transitions = self.her.get_hindsight_transitions(sliced, extras={"policy_obs_dim": self.policy_obs_dim})
-            self.buffer.add(
-                new_transitions["obs"],
-                new_transitions["action"],
-                new_transitions["reward"],
-                new_transitions["next_obs"],
-                new_transitions["done"],
-            )
+            for _ in range(self.cfg.her_cfg.k):
+                new_transitions = self.her.get_hindsight_transitions(sliced, extras={"policy_obs_dim": self.policy_obs_dim})
+                self.buffer.add(
+                    new_transitions["obs"],
+                    new_transitions["action"],
+                    new_transitions["reward"],
+                    new_transitions["next_obs"],
+                    new_transitions["done"],
+                )
             if new_transitions["reward"].shape[0] != 0:
                 self.writer.add_histogram("her/distances", new_transitions["distances"], self.global_step)
                 self.writer.add_histogram("her/rewards", new_transitions["reward"], self.global_step)
