@@ -268,7 +268,10 @@ class SACRunner(BaseRunner):
                 ep_infos=ep_infos,
             )
 
+            prev_warmup = self.warmup
             self.warmup = self.global_step <= self.cfg.warmup_transitions
+            if prev_warmup and not self.warmup:
+                print("[SAC] Warmup over, starting policy rollout")
             if not self.warmup:
                 all_keys = set(k for d in ep_infos for k in d)
                 for key in all_keys:
@@ -283,8 +286,7 @@ class SACRunner(BaseRunner):
 
             if self.warmup and train_step % 10 == 0:
                 print(f"[SAC] Warming up, {self.global_step} out of {self.cfg.warmup_transitions} ({100*self.global_step / self.cfg.warmup_transitions:.1f}%)")
-            if self.global_step >= self.cfg.warmup_transitions and self.global_step <= self.cfg.warmup_transitions + self.num_envs*self.cfg.steps_per_iter:
-                print("[SAC] Warmup over, starting policy rollout")
+
 
             if not self.warmup and train_step % self.cfg.save_interval == 0:
                 self.save_checkpoint()
@@ -336,6 +338,7 @@ class SACRunner(BaseRunner):
 
             self.writer.add_scalar("q_target/log_prob", log_prob.mean(), self.global_step)
             self.writer.add_scalar("q_target/q", q.mean(), self.global_step)
+            self.writer.add_scalar("q_target/entropy_bonus", -(self.alpha * log_prob).mean(), self.global_step)
 
 
         return rew_scaled + self.cfg.gamma * (1 - dones.int()) * (q - self.alpha * log_prob)
