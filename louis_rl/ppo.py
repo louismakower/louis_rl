@@ -2,11 +2,12 @@ from __future__ import annotations
 from dataclasses import dataclass, MISSING
 import torch
 from torch.distributions import MultivariateNormal
+from torch.utils.tensorboard import SummaryWriter
 import torch.nn as nn
 from torch import optim
 
 from .base_runner import BaseRunner
-from .vec_env import VecEnv, Logger
+from .vec_env import VecEnv
 
 
 class PPORunner(BaseRunner):
@@ -15,7 +16,6 @@ class PPORunner(BaseRunner):
             env: VecEnv,
             cfg: PPORunnerCfg,
             log_dir: str,
-            writer: Logger,
     ):
         super().__init__(log_dir)
         self._env = env
@@ -33,7 +33,7 @@ class PPORunner(BaseRunner):
         self.timeout_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, dtype=torch.bool, device=self.device)
         self.log_prob_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, device=self.device)
         self.V_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, device=self.device)
-        self.writer = writer
+        self.writer = SummaryWriter(log_dir=log_dir)
 
         self.cov_mat = torch.diag(
             torch.full(size=(self.act_dim,), fill_value=0.5),

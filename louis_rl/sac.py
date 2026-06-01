@@ -5,12 +5,13 @@ import torch
 
 from rl_games.common.experience import VectorizedReplayBuffer
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
+from torch.utils.tensorboard import SummaryWriter
 
 from .networks import Policy, Q
 from .reward_normaliser import RewardNormalizer
 from .base_runner import BaseRunner
 from .her import HERCfg
-from .vec_env import VecEnv, Logger
+from .vec_env import VecEnv
 
 def _recurse_obs(item, fn):
     new_dict = {}
@@ -27,7 +28,6 @@ class SACRunner(BaseRunner):
             env: VecEnv,
             cfg: SACRunnerCfg,
             log_dir: str,
-            writer: Logger,
     ):
         super().__init__(log_dir)
         self._env: VecEnv = env
@@ -48,7 +48,7 @@ class SACRunner(BaseRunner):
         if self.her is not None:
             self.her.policy_obs_dim = self.policy_obs_dim
         self._init_networks()
-        self.writer = writer
+        self.writer = SummaryWriter(log_dir=log_dir)
         if self.cfg.reward_scaling:
             self.rew_norm = RewardNormalizer(
                 gamma=cfg.gamma,
@@ -452,8 +452,6 @@ class SACRunnerCfg:
     experiment_name: str = MISSING
 
     save_interval: int = MISSING
-
-    collect_states: bool = MISSING
 
     her_cfg: HERCfg | None = None
     algo_name: str = "sac"
