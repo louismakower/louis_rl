@@ -149,7 +149,7 @@ class SACRunner(BaseRunner):
             obs = next_obs
 
         replay_buffer_state = self.buffer.capacity if self.buffer.full else self.buffer.idx
-        self.writer.add_scalar("misc/replay_buffer_state", replay_buffer_state, self.global_step)
+        self.writer.add_scalar("buffer/replay_buffer_state", replay_buffer_state, self.global_step)
         ep_infos.append(extras.get("log", {}))
         return obs
 
@@ -227,8 +227,9 @@ class SACRunner(BaseRunner):
         b_next_obs_n = self.obs_norm(b_next_obs)
         if update_step == 0:
             for i in range(0, b_act.shape[-1], 1):
-                self.writer.add_histogram(f"act/dim_{i}", b_act[:, i], self.global_step)
-
+                self.writer.add_histogram(f"buffer/act_dim_{i}", b_act[:, i], self.global_step)
+            for i in range(b_obs.shape[-1]):
+                self.writer.add_histogram(f"buffer/obs_dim_{i}", b_obs[:, i], self.global_step)
         # train Q
         b_extrns_rew_scaled = self.rew_norm.normalize_rewards(b_extrns_rew) if self.cfg.reward_scaling else b_extrns_rew
         b_extrns_rew_scaled = torch.clamp(b_extrns_rew_scaled, -self.cfg.reward_clip, self.cfg.reward_clip) if self.cfg.reward_clip > 0 else b_extrns_rew_scaled
