@@ -56,6 +56,7 @@ class SACRunner(BaseRunner):
                 device=self._env.device,
             )
         self._print_UTD_ratio()
+        self.log_histograms = self.cfg.log_histograms
 
     def _print_UTD_ratio(self):
         updates = self.cfg.num_train_updates
@@ -225,7 +226,7 @@ class SACRunner(BaseRunner):
         b_obs, b_act, b_extrns_rew, b_next_obs, b_dones = self.buffer.sample(self.cfg.batch_size)
         b_obs_n = self.obs_norm(b_obs)
         b_next_obs_n = self.obs_norm(b_next_obs)
-        if update_step == 0:
+        if update_step == 0 and self.log_histograms:
             for i in range(0, b_act.shape[-1], 1):
                 self.writer.add_histogram(f"buffer/act_dim_{i}", b_act[:, i], self.global_step)
             for i in range(b_obs.shape[-1]):
@@ -455,3 +456,5 @@ class SACRunnerCfg:
 
     her_cfg: HERCfg | None = None
     algo_name: str = "sac"
+
+    log_histograms: bool = False
