@@ -8,7 +8,7 @@ from rl_games.algos_torch.running_mean_std import RunningMeanStd
 from torch.utils.tensorboard import SummaryWriter
 
 from .networks import Policy, Q
-from .reward_normaliser import RewardNormalizer
+from .reward_normaliser import RewardNormaliser
 from .base_runner import BaseRunner
 from .her import HERCfg
 from .vec_env import VecEnv
@@ -50,7 +50,7 @@ class SACRunner(BaseRunner):
         self._init_networks()
         self.writer = SummaryWriter(log_dir=log_dir)
         if self.cfg.reward_scaling:
-            self.rew_norm = RewardNormalizer(
+            self.rew_norm = RewardNormaliser(
                 gamma=cfg.gamma,
                 G_max=cfg.reward_G_max,
                 device=self._env.device,
@@ -126,6 +126,8 @@ class SACRunner(BaseRunner):
             self.global_step += self.num_envs
 
             self.writer.add_scalar("rewards/extrinsic_mean", ex_rew.mean(), self.global_step)
+            self.writer.add_scalar("terminations/term", term.float().mean(), self.global_step)
+            self.writer.add_scalar("terminations/timeout", timeout.float().mean(), self.global_step)
             if self.cfg.reward_scaling:
                 self.rew_norm.update_reward_stats(ex_rew, term, timeout)
 
@@ -232,7 +234,7 @@ class SACRunner(BaseRunner):
             for i in range(b_obs.shape[-1]):
                 self.writer.add_histogram(f"buffer/obs_dim_{i}", b_obs[:, i], self.global_step)
         # train Q
-        b_extrns_rew_scaled = self.rew_norm.normalize_rewards(b_extrns_rew) if self.cfg.reward_scaling else b_extrns_rew
+        b_extrns_rew_scaled = self.rew_norm.normalise_rewards(b_extrns_rew) if self.cfg.reward_scaling else b_extrns_rew
         b_extrns_rew_scaled = torch.clamp(b_extrns_rew_scaled, -self.cfg.reward_clip, self.cfg.reward_clip) if self.cfg.reward_clip > 0 else b_extrns_rew_scaled
         q_targ = self._compute_q_targ(b_extrns_rew_scaled, b_next_obs_n, b_dones)
 

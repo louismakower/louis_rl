@@ -78,7 +78,7 @@ class _RunningMeanStd:
         )
 
 
-class RewardNormalizer:
+class RewardNormaliser:
     """Normalise rewards by dividing by the std of the running discounted return.
 
     Denominator = max(sqrt(var(G_r)), G_r_max / G_max) to protect against low-variance
@@ -111,7 +111,7 @@ class RewardNormalizer:
         )
         self.G_rms.update(self.G_r)
 
-    def normalize_rewards(self, rewards: torch.Tensor) -> torch.Tensor:
+    def normalise_rewards(self, rewards: torch.Tensor) -> torch.Tensor:
         return _scale_reward(
             rewards=rewards,
             G_var=self.G_rms.var,
