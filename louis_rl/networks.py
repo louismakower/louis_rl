@@ -8,6 +8,13 @@ import torch.nn as nn
 
 from rl_games.algos_torch.sac_helper import SquashedNormal
 
+def build_mlp(sizes, device) -> nn.Module:
+    layers = []
+    for i in range(len(sizes) - 1):
+        layers.append(nn.Linear(sizes[i], sizes[i + 1]))
+        if i != len(sizes) - 2:
+            layers.append(nn.GELU())
+    return nn.Sequential(*layers).to(device=device)
 
 class Policy:
     def __init__(
@@ -32,7 +39,10 @@ class Policy:
         self.obs_size = obs_size
         self.hidden_dims = hidden_dims
         self.action_shape = action_shape
-        self.network = self._build_network()
+        self.network = build_mlp(
+            sizes=(self.obs_size, *self.hidden_dims, 2*self.action_shape),
+            device=self.device
+        )
         self.optimiser = optim.AdamW(self.network.parameters(), lr=lr)
         self.log_alpha_optimiser = torch.optim.AdamW(
             [self.log_alpha],
@@ -59,19 +69,6 @@ class Policy:
 
         return self.log_alpha.detach().exp().item(), min_this.item(), alpha_loss.item()
 
-    def _build_network(self):
-        layers = []
-        layers.append(nn.Linear(self.obs_size, self.hidden_dims[0]))
-        layers.append(nn.GELU())
-
-        for i in range(len(self.hidden_dims) - 1):
-            layers.append(nn.Linear(self.hidden_dims[i], self.hidden_dims[i + 1]))
-            layers.append(nn.GELU())
-
-        layers.append(nn.Linear(self.hidden_dims[-1], 2 * self.action_shape))
-
-        return nn.Sequential(*layers).to(device=self.device)
-
     def dist(self, obs):
         mu, logstd = self.network(obs).chunk(2, dim=-1)
         logstd = torch.clamp(logstd, self.logstd_min, self.logstd_max)
@@ -91,20 +88,15 @@ class Q:
             grad_clip_norm: float = 1.0,
     ):
         self.device = device
-        self.network: nn.Module = self._build_network([in_size, *hidden_dims, out_size])
+        self.network: nn.Module = build_mlp(
+            sizes=(in_size, *hidden_dims, out_size),
+            device=self.device
+        )
         self.optimiser = optim.AdamW(self.network.parameters(), lr=lr)
         self.loss = nn.MSELoss()
         self.target = copy.deepcopy(self.network)
         self.tau = tau
         self.grad_clip_norm = grad_clip_norm
-
-    def _build_network(self, sizes) -> nn.Module:
-        layers = []
-        for i in range(len(sizes) - 1):
-            layers.append(nn.Linear(sizes[i], sizes[i + 1]))
-            if i != len(sizes) - 2:
-                layers.append(nn.GELU())
-        return nn.Sequential(*layers).to(device=self.device)
 
     def train_one_step(self, x, y):
         self.optimiser.zero_grad()

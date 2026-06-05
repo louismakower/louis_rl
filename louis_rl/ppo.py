@@ -8,7 +8,7 @@ from torch import optim
 
 from .base_runner import BaseRunner
 from .vec_env import VecEnv
-
+from .networks import build_mlp
 
 class PPORunner(BaseRunner):
     def __init__(
@@ -45,17 +45,15 @@ class PPORunner(BaseRunner):
         goal_obs_dim = sum(goal_obs[k].shape[0] for k in goal_obs) if goal_obs else 0
         self.obs_shape = self.policy_obs_dim + goal_obs_dim
 
-    def _build_mlp(self, in_dim: int, out_dim: int, hidden_dims: list[int]) -> nn.Sequential:
-        dims = [in_dim] + hidden_dims
-        layers = []
-        for i in range(len(dims) - 1):
-            layers += [nn.Linear(dims[i], dims[i + 1]), nn.GELU()]
-        layers.append(nn.Linear(dims[-1], out_dim))
-        return nn.Sequential(*layers)
-
     def _init_networks(self):
-        self.policy = self._build_mlp(self.obs_shape, self.act_dim, self.cfg.policy_hidden_dims).to(self.device)
-        self.v = self._build_mlp(self.obs_shape, 1, self.cfg.v_hidden_dims).to(self.device)
+        self.policy = build_mlp(
+            sizes=(self.obs_shape, *self.cfg.policy_hidden_dims, self.act_dim),
+            device=self.device,
+        )
+        self.v = build_mlp(
+            sizes=(self.obs_shape, *self.cfg.v_hidden_dims, 1),
+            device=self.device
+        )
         self.policy_optim = optim.AdamW(self.policy.parameters(), lr=self.cfg.policy_lr)
         self.v_optim = optim.AdamW(self.v.parameters(), lr=self.cfg.v_lr)
         self.mse = nn.MSELoss()
