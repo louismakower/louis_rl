@@ -54,6 +54,8 @@ class SACRunner(BaseRunner):
                 gamma=cfg.gamma,
                 G_max=cfg.reward_G_max,
                 device=self._env.device,
+                mode=cfg.reward_norm_type,
+                ema_param=cfg.reward_ema_param,
             )
         self._print_UTD_ratio()
         self.log_histograms = self.cfg.log_histograms
@@ -234,11 +236,16 @@ class SACRunner(BaseRunner):
             for i in range(b_obs.shape[-1]):
                 self.writer.add_histogram(f"buffer/obs_dim_{i}", b_obs[:, i], self.global_step)
         # train Q
-        b_extrns_rew_scaled = self.rew_norm.normalise_rewards(b_extrns_rew) if self.cfg.reward_scaling else b_extrns_rew
+        if self.cfg.reward_scaling:
+            b_extrns_rew_scaled, rew_scale = self.rew_norm.normalise_rewards(b_extrns_rew)
+        else:
+            b_extrns_rew_scaled, rew_scale = b_extrns_rew, 1.0
+            
         b_extrns_rew_scaled = torch.clamp(b_extrns_rew_scaled, -self.cfg.reward_clip, self.cfg.reward_clip) if self.cfg.reward_clip > 0 else b_extrns_rew_scaled
         q_targ = self._compute_q_targ(b_extrns_rew_scaled, b_next_obs_n, b_dones)
 
         # bookeeping
+        self.writer.add_scalar("q_target/reward_scale", rew_scale, self.global_step)
         self.writer.add_scalar("q_target/extrinsic_rew", b_extrns_rew.mean(), self.global_step)
         self.writer.add_scalar("q_target/extrinsic_rew_std", b_extrns_rew.std(), self.global_step)
         self.writer.add_scalar("q_target/extrinsic_rew_scaled", b_extrns_rew_scaled.mean(), self.global_step)
@@ -264,6 +271,7 @@ class SACRunner(BaseRunner):
 
     def learn(self):
         obs, extras = self._env.reset()
+        self._env.randomise_ep_counters()
         self.warmup = True
         ep_infos = []
         for train_step in range(self.cfg.max_steps // self.cfg.steps_per_iter):
@@ -441,10 +449,6 @@ class SACRunnerCfg:
     logstd_max: float = MISSING
     policy_learning_rate: float = MISSING
 
-    reward_scaling: bool = MISSING
-    reward_G_max: float = MISSING  # ignored when reward_scaling=False
-    reward_clip: float = MISSING  # 0.0 = disabled
-
     # training
     max_steps: int = MISSING
     steps_per_iter: int = MISSING
@@ -455,6 +459,14 @@ class SACRunnerCfg:
     experiment_name: str = MISSING
 
     save_interval: int = MISSING
+    
+    # reward scaling
+    reward_scaling: bool = MISSING
+    reward_G_max: float = MISSING  # ignored when reward_scaling=False
+    reward_clip: float = MISSING  # 0.0 = disabled
+    reward_norm_type: str = "mean"  # mean or ema
+    reward_ema_param: float | None = None
+
 
     her_cfg: HERCfg | None = None
     algo_name: str = "sac"

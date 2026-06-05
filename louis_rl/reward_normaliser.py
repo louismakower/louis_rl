@@ -33,7 +33,7 @@ def _scale_reward(
     var_denominator = torch.sqrt(G_var + eps)
     min_required_denominator = G_r_max / G_max
     denominator = torch.maximum(var_denominator, min_required_denominator)
-    return rewards / denominator
+    return rewards / denominator, 1 / denominator # 1/denom is returned for logging
 
 
 @torch.compile
@@ -43,30 +43,42 @@ def _update_mean_var_count_from_moments(
     running_var: torch.Tensor,
     running_count: torch.Tensor,
     epsilon: float,
+    mode: str,
+    ema_param: None | float = None
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     sample_mean = torch.mean(samples, dim=0)
     sample_var = torch.var(samples, dim=0, unbiased=False)
     sample_count = float(samples.shape[0])
-
-    delta = sample_mean - running_mean
+    
     total_count = running_count + sample_count
-    ratio = sample_count / total_count
+    
+    if mode == "mean":
+        delta = sample_mean - running_mean
+        ratio = sample_count / total_count
 
-    new_mean = running_mean + delta * ratio
-    m_a = running_var * (running_count + epsilon)
-    m_b = sample_var * sample_count
-    M2 = m_a + m_b + torch.square(delta) * running_count * ratio
-    new_var = M2 / total_count
+        new_mean = running_mean + delta * ratio
+        m_a = running_var * (running_count + epsilon)
+        m_b = sample_var * sample_count
+        M2 = m_a + m_b + torch.square(delta) * running_count * ratio
+        new_var = M2 / total_count
+    elif mode == "ema":
+        new_mean = running_mean * ema_param + (1 - ema_param) * sample_mean
+        sample_sq = torch.mean(samples ** 2, dim=0)
+        running_sq = running_var + running_mean ** 2
+        new_sq = running_sq * ema_param + (1 - ema_param) * sample_sq
+        new_var = new_sq - new_mean ** 2  
 
     return new_mean, new_var, total_count
 
 
 class _RunningMeanStd:
-    def __init__(self, device: torch.device, epsilon: float = 1e-4, shape: tuple[int, ...] = ()):
+    def __init__(self, device: torch.device, epsilon: float = 1e-4, shape: tuple[int, ...] = (), mode: str = "mean", ema_param: None | float = None):
         self.mean = torch.zeros(shape, dtype=torch.float32, device=device)
         self.var = torch.ones(shape, dtype=torch.float32, device=device)
         self.count = torch.tensor(0.0, dtype=torch.float32, device=device)
         self.epsilon = epsilon
+        self.mode = mode
+        self.ema_param = ema_param
 
     def update(self, x: torch.Tensor) -> None:
         self.mean, self.var, self.count = _update_mean_var_count_from_moments(
@@ -75,6 +87,8 @@ class _RunningMeanStd:
             running_var=self.var,
             running_count=self.count,
             epsilon=self.epsilon,
+            mode=self.mode,
+            ema_param=self.ema_param,
         )
 
 
@@ -87,13 +101,13 @@ class RewardNormaliser:
     Call update_reward_stats() every env step, normalize_rewards() on sampled batches.
     """
 
-    def __init__(self, gamma: float, G_max: float, device: torch.device, epsilon: float = 1e-8):
+    def __init__(self, gamma: float, G_max: float, device: torch.device, epsilon: float = 1e-8, mode="mean", ema_param=None):
         self.gamma = gamma
         self.G_max = G_max
         self.epsilon = epsilon
         self.G_r = torch.zeros(1, dtype=torch.float32, device=device)
         self.G_r_max = torch.zeros(1, dtype=torch.float32, device=device)
-        self.G_rms = _RunningMeanStd(shape=(1,), device=device)
+        self.G_rms = _RunningMeanStd(shape=(1,), device=device, mode=mode, ema_param=ema_param)
 
     def update_reward_stats(
         self,
