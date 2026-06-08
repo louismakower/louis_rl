@@ -3,13 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass, MISSING
 import torch
 
-from rl_games.common.experience import VectorizedReplayBuffer
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
 from torch.utils.tensorboard import SummaryWriter
 
 from .networks import Policy, Q, IntrinsicV
 from .reward_normaliser import RewardNormaliser
 from .base_runner import BaseRunner
+from .experience import VectorizedReplayBuffer
 from .her import HERCfg
 from .vec_env import VecEnv
 from .intrinsic import RND, RNDCfg
@@ -60,6 +60,7 @@ class SACRunner(BaseRunner):
             )
         else:
             self.rnd = None
+            self.intrinsic_value = None
         
         self._init_obs()
         if self.her is not None:
@@ -159,7 +160,13 @@ class SACRunner(BaseRunner):
             done = term.unsqueeze(1)  # ie DO bootstrap on timeout, DON'T on termination
             # buffer contains transitions which have the RAW observations
             # the goal observation has been added to it
-            self.buffer.add(obs_t, action, ex_rew.unsqueeze(1), next_obs_for_buffer, done)
+            self.buffer.add({
+                "obs": obs_t,
+                "action": action,
+                "rew": ex_rew.unsqueeze(1),
+                "next_obs": next_obs_for_buffer,
+                "done": done
+            })
 
             if self.her:
                 self.get_her_and_add_to_buffer(
@@ -231,13 +238,13 @@ class SACRunner(BaseRunner):
 
             for _ in range(self.cfg.her_cfg.k):
                 new_transitions = self.her.get_hindsight_transitions(sliced, extras={"policy_obs_dim": self.policy_obs_dim})
-                self.buffer.add(
-                    new_transitions["obs"],
-                    new_transitions["action"],
-                    new_transitions["reward"],
-                    new_transitions["next_obs"],
-                    new_transitions["done"],
-                )
+                self.buffer.add({
+                    "obs": new_transitions["obs"],
+                    "action": new_transitions["action"],
+                    "rew": new_transitions["reward"],
+                    "next_obs": new_transitions["next_obs"],
+                    "done": new_transitions["done"],
+                })
             if new_transitions["reward"].shape[0] != 0:
                 self.writer.add_histogram("her/distances", new_transitions["distances"], self.global_step)
                 self.writer.add_histogram("her/rewards", new_transitions["reward"], self.global_step)
@@ -250,7 +257,8 @@ class SACRunner(BaseRunner):
         )
 
     def train_batch(self, update_step):
-        b_obs, b_act, b_extrns_rew, b_next_obs, b_dones = self.buffer.sample(self.cfg.batch_size)
+        sample  = self.buffer.sample(self.cfg.batch_size)
+        b_obs, b_act, b_extrns_rew, b_next_obs, b_dones = sample["obs"], sample["action"], sample["rew"], sample["next_obs"], sample["done"]
         b_obs_n = self.obs_norm(b_obs)
         b_next_obs_n = self.obs_norm(b_next_obs)
         if update_step == 0 and self.log_histograms:
@@ -273,7 +281,7 @@ class SACRunner(BaseRunner):
             b_intrns_rew_scaled = b_intrns_rew  # TODO: need to scale intrinsic rewards separately to extrinsic
             b_intrns_rew_scaled = torch.clamp(b_intrns_rew_scaled, -self.cfg.rnd_rew_clip, self.cfg.rnd_rew_clip) if self.cfg.rnd_rew_clip > 0 else b_intrns_rew_scaled
 
-        b_extrns_rew_scaled + self.cfg.rnd_rew_weight * b_intrns_rew_scaled
+            b_extrns_rew_scaled + self.cfg.rnd_rew_weight * b_intrns_rew_scaled
 
         b_extrns_rew_scaled = torch.clamp(b_extrns_rew_scaled, -self.cfg.reward_clip, self.cfg.reward_clip) if self.cfg.reward_clip > 0 else b_extrns_rew_scaled
         q_targ = self._compute_q_targ(b_extrns_rew_scaled, b_next_obs_n, b_dones)
@@ -434,11 +442,16 @@ class SACRunner(BaseRunner):
 
     def _init_buffer(self):
         return VectorizedReplayBuffer(
-                obs_shape=[self.obs_shape],
-                action_shape=[self.action_shape],
-                capacity=self.cfg.replay_buffer_size,
-                device=self._env.device,
-            )
+            tensor_desc={
+                "obs": (self.obs_shape, torch.float32),
+                "next_obs": (self.obs_shape, torch.float32),
+                "action": (self.action_shape, torch.float32),
+                "rew": (1, torch.float32),
+                "done": (1, torch.bool),
+            },
+            capacity=self.cfg.replay_buffer_size,
+            device=self._env.device
+        )
 
     def _init_policy(self):
         return Policy(
