@@ -122,28 +122,3 @@ class Q:
             q1_targ_out = self.target(x)
         mse = ((q1_out - q1_targ_out)**2).mean()
         return mse
-    
-
-class IntrinsicV:
-    def __init__(
-            self,
-            rnd_obs_dim,
-            rnd_value_hidden_dims,
-            lr,
-            device,
-    ):
-        self.device = device
-        self.network = build_mlp(
-            sizes=(rnd_obs_dim, *rnd_value_hidden_dims, 1),
-            device=self.device,
-        )
-        self.optimiser = optim.AdamW(params=self.v.parameters(), lr=lr)
-        self.loss = nn.MSELoss()
-
-    def train_one_step(self, x, y):
-        self.optimiser.zero_grad()
-        out = self.network.forward(x)
-        loss = self.loss(out, y)
-        loss.backward()
-        self.optimiser.step()
-        return loss.item()

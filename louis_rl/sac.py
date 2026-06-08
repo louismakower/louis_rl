@@ -6,7 +6,7 @@ import torch
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
 from torch.utils.tensorboard import SummaryWriter
 
-from .networks import Policy, Q, IntrinsicV
+from .networks import Policy, Q
 from .reward_normaliser import RewardNormaliser
 from .base_runner import BaseRunner
 from .experience import VectorizedReplayBuffer
@@ -41,30 +41,33 @@ class SACRunner(BaseRunner):
         self.action_shape = self._env.action_space.shape[0]
         self.target_entropy = -self.action_shape if self.cfg.target_entropy == "auto" else float(self.cfg.target_entropy)
         print(f"[SAC]: Target entropy set to {self.target_entropy}")
+
+        self._init_obs()
         
         # HER
         if self.cfg.her_cfg:
             self.her = cfg.her_cfg
+            self.her.policy_obs_dim = self.policy_obs_dim
         else:
             self.her = None
         
         # RND
         if self.cfg.use_rnd:
-            rnd_obs_dim = self._env.observation_space.get("rnd")
-            self.rnd = RND(self.cfg.rnd_cfg, device=self.device, obs_dim=rnd_obs_dim)
-            self.intrinsic_value = IntrinsicV(
-                rnd_obs_dim=rnd_obs_dim,
-                rnd_value_hidden_dims=self.cfg.rnd_value_hidden_layers,
-                lr=self.cfg.rnd_value_lr,
+            self.rnd_obs_shape = self._env.observation_space["rnd"].shape[0]
+            self.rnd = RND(self.cfg.rnd_cfg, device=self.device, obs_dim=self.rnd_obs_shape)
+            self.intrinsic_critic = Q(
+                in_size=self.action_shape + self.obs_shape,
+                hidden_dims=self.cfg.rnd_critic_hidden_layers,
+                out_size=1,
+                lr=self.cfg.rnd_critic_lr,
+                tau=self.cfg.rnd_critic_tau,
                 device=self.device,
             )
+            self.intrinsic_rew_norm = RunningMeanStd(insize=(1,), norm_only=True).to(self._env.device)
         else:
             self.rnd = None
-            self.intrinsic_value = None
+            self.intrinsic_critic = None
         
-        self._init_obs()
-        if self.her is not None:
-            self.her.policy_obs_dim = self.policy_obs_dim
         self._init_networks()
         self.writer = SummaryWriter(log_dir=log_dir)
         if self.cfg.reward_scaling:
@@ -97,8 +100,8 @@ class SACRunner(BaseRunner):
         self.policy.network.eval()
         self.obs_norm.eval()
         if self.rnd:
-            self.rnd.set_eval()
-            self.intrinsic_value.network.eval()
+            # train/eval mode for RND is handled inside RND
+            self.intrinsic_rew_norm.eval()
 
     def _set_train(self):
         self.q1.network.train()
@@ -106,8 +109,8 @@ class SACRunner(BaseRunner):
         self.policy.network.train()
         self.obs_norm.train()
         if self.rnd:
-            self.rnd.set_train()
-            self.intrinsic_value.network.train()
+            # train/eval mode for RND is handled inside RND
+            self.intrinsic_rew_norm.train()
 
     def _get_checkpoint(self) -> dict:
         return {
@@ -160,13 +163,20 @@ class SACRunner(BaseRunner):
             done = term.unsqueeze(1)  # ie DO bootstrap on timeout, DON'T on termination
             # buffer contains transitions which have the RAW observations
             # the goal observation has been added to it
-            self.buffer.add({
+            buffer_data = {
                 "obs": obs_t,
                 "action": action,
                 "rew": ex_rew.unsqueeze(1),
                 "next_obs": next_obs_for_buffer,
                 "done": done
-            })
+            }
+            if self.rnd:
+                terminal_rnd = extras["terminal_obs"]["rnd"]
+                rnd_next = torch.where(resetted.unsqueeze(-1), terminal_rnd, next_obs["rnd"])
+                buffer_data.update({
+                    "rnd_obs": rnd_next
+                })
+            self.buffer.add(buffer_data)
 
             if self.her:
                 self.get_her_and_add_to_buffer(
@@ -178,6 +188,7 @@ class SACRunner(BaseRunner):
                     term=term,
                     resetted=resetted,
                     extras=extras,
+                    rnd_obs=rnd_next if self.rnd else None
                 )
 
 
@@ -198,6 +209,7 @@ class SACRunner(BaseRunner):
             term,
             resetted,
             extras,
+            rnd_obs,
     ):
         if self.her.her_obs_buf is None:
             self._init_her_obs_buf(obs["her"])
@@ -209,6 +221,8 @@ class SACRunner(BaseRunner):
         self.her.trajectories["term"][ptr, self.env_arange] = term.unsqueeze(1)
         for key, val in obs["her"].items():
             self.her.her_obs_buf[key][ptr, self.env_arange] = val
+        if self.rnd:
+            self.her.trajectories["rnd_obs"][ptr, self.env_arange] = rnd_obs
 
         # fill next_her_obs: use terminal_obs for reset envs, next_obs for others
         for key, val in next_obs["her"].items():
@@ -232,19 +246,28 @@ class SACRunner(BaseRunner):
                 "her_next_obs": {k: self.her.her_next_obs_buf[k][:max_len, term_envs] for k in self.her.her_next_obs_buf},
                 "lengths": lengths,
             }
+            if self.rnd:
+                sliced.update({
+                    "rnd_obs": self.her.trajectories["rnd_obs"][:max_len, term_envs],
+                })
 
             t_idx = torch.arange(max_len, device=self.device).unsqueeze(1)  # (max_len, 1)
             sliced["valid"] = (t_idx < lengths.unsqueeze(0)).reshape(-1)    # (max_len * num_term,)
 
             for _ in range(self.cfg.her_cfg.k):
                 new_transitions = self.her.get_hindsight_transitions(sliced, extras={"policy_obs_dim": self.policy_obs_dim})
-                self.buffer.add({
+                buffer_data = {
                     "obs": new_transitions["obs"],
                     "action": new_transitions["action"],
                     "rew": new_transitions["reward"],
                     "next_obs": new_transitions["next_obs"],
                     "done": new_transitions["done"],
-                })
+                }
+                if self.rnd:
+                    buffer_data.update({
+                        "rnd_obs": new_transitions["rnd_obs"],
+                    })
+                self.buffer.add(buffer_data)
             if new_transitions["reward"].shape[0] != 0:
                 self.writer.add_histogram("her/distances", new_transitions["distances"], self.global_step)
                 self.writer.add_histogram("her/rewards", new_transitions["reward"], self.global_step)
@@ -259,6 +282,10 @@ class SACRunner(BaseRunner):
     def train_batch(self, update_step):
         sample  = self.buffer.sample(self.cfg.batch_size)
         b_obs, b_act, b_extrns_rew, b_next_obs, b_dones = sample["obs"], sample["action"], sample["rew"], sample["next_obs"], sample["done"]
+        if self.rnd:
+            b_rnd_obs = sample["rnd_obs"]
+        else:
+            b_rnd_obs = None
         b_obs_n = self.obs_norm(b_obs)
         b_next_obs_n = self.obs_norm(b_next_obs)
         if update_step == 0 and self.log_histograms:
@@ -267,24 +294,30 @@ class SACRunner(BaseRunner):
             for i in range(b_obs.shape[-1]):
                 self.writer.add_histogram(f"buffer/obs_dim_{i}", b_obs[:, i], self.global_step)
         
-        # train Q
+        # scale extrinsic rewards
         if self.cfg.reward_scaling:
             b_extrns_rew_scaled, rew_scale = self.rew_norm.normalise_rewards(b_extrns_rew)
         else:
             b_extrns_rew_scaled, rew_scale = b_extrns_rew, 1.0
             
+        b_extrns_rew_scaled = torch.clamp(b_extrns_rew_scaled, -self.cfg.reward_clip, self.cfg.reward_clip) if self.cfg.reward_clip > 0 else b_extrns_rew_scaled
+
         # RND
         if self.rnd:
-            # TODO: need a separate buffer for rnd obs
-            # TODO: also need to handle normalisation of these observations
-            b_intrns_rew = self.rnd.get_intrinsic_rew()  # TODO: add rnd obs here
-            b_intrns_rew_scaled = b_intrns_rew  # TODO: need to scale intrinsic rewards separately to extrinsic
+            # observation normalisation handled inside RND
+            b_intrns_rew = self.rnd.get_intrinsic_rew(b_rnd_obs)
+            b_intrns_rew_scaled = self.intrinsic_rew_norm(b_intrns_rew )
             b_intrns_rew_scaled = torch.clamp(b_intrns_rew_scaled, -self.cfg.rnd_rew_clip, self.cfg.rnd_rew_clip) if self.cfg.rnd_rew_clip > 0 else b_intrns_rew_scaled
+            self.writer.add_scalar("rnd/intrinsic_rew", b_intrns_rew.mean(), self.global_step)
+            self.writer.add_scalar("rnd/intrinsic_rew_scaled", b_intrns_rew_scaled.mean(), self.global_step)
 
-            b_extrns_rew_scaled + self.cfg.rnd_rew_weight * b_intrns_rew_scaled
 
-        b_extrns_rew_scaled = torch.clamp(b_extrns_rew_scaled, -self.cfg.reward_clip, self.cfg.reward_clip) if self.cfg.reward_clip > 0 else b_extrns_rew_scaled
-        q_targ = self._compute_q_targ(b_extrns_rew_scaled, b_next_obs_n, b_dones)
+        ext_q_targ = self._compute_q_targ(b_extrns_rew_scaled, b_next_obs_n, b_dones)
+        if self.rnd:
+            intrns_q_targ = self._compute_intrns_q_targ(b_intrns_rew_scaled, b_next_obs_n)
+        else:
+            intrns_q_targ = None
+
 
         # bookeeping
         self.writer.add_scalar("q_target/reward_scale", rew_scale, self.global_step)
@@ -292,13 +325,23 @@ class SACRunner(BaseRunner):
         self.writer.add_scalar("q_target/extrinsic_rew_std", b_extrns_rew.std(), self.global_step)
         self.writer.add_scalar("q_target/extrinsic_rew_scaled", b_extrns_rew_scaled.mean(), self.global_step)
         self.writer.add_scalar("q_target/extrinsic_rew_scaled_std", b_extrns_rew_scaled.std(), self.global_step)
-        self.writer.add_scalar("critic/q_target", q_targ.mean(), self.global_step)
+        self.writer.add_scalar("critic/q_target", ext_q_targ.mean(), self.global_step)
 
+        # train Q
         q_input = self._q_input(b_obs_n, b_act)
-        q1_loss = self.q1.train_one_step(q_input, q_targ)
-        q2_loss = self.q2.train_one_step(q_input, q_targ)
+        q1_loss = self.q1.train_one_step(q_input, ext_q_targ)
+        q2_loss = self.q2.train_one_step(q_input, ext_q_targ)
         self.writer.add_scalar("critic/q1_loss", q1_loss, self.global_step)
         self.writer.add_scalar("critic/q2_loss", q2_loss, self.global_step)
+        
+        # train RND network
+        if self.rnd:
+            self.rnd.train_one_step(b_rnd_obs)
+            rnd_value_loss = self.intrinsic_critic.train_one_step(q_input, intrns_q_targ)
+            self.intrinsic_critic.update_target()
+            intrinsic_critic_diff = self.intrinsic_critic.target_network_diff(q_input)
+            self.writer.add_scalar("rnd/targ_diff", intrinsic_critic_diff, self.global_step)
+            self.writer.add_scalar("rnd/critic_loss", rnd_value_loss, self.global_step)
 
         # train policy
         self._train_onestep_policy(b_obs_n)
@@ -310,6 +353,8 @@ class SACRunner(BaseRunner):
         q2_targ_diff = self.q2.target_network_diff(q_input)
         self.writer.add_scalar("critic/q1_targ_diff", q1_targ_diff, self.global_step)
         self.writer.add_scalar("critic/q2_targ_diff", q2_targ_diff, self.global_step)
+
+
 
     def learn(self):
         obs, extras = self._env.reset()
@@ -352,20 +397,32 @@ class SACRunner(BaseRunner):
             p.requires_grad = t
         for p in self.q2.network.parameters():
             p.requires_grad = t
+        if self.rnd:
+            for p in self.intrinsic_critic.network.parameters():
+                p.requires_grad = t
 
     def _train_onestep_policy(self, obs_n):
         dist = self.policy.dist(obs_n)
         act = dist.rsample()
         log_prob = dist.log_prob(act).sum(dim=-1, keepdim=True)  # sum over action dimensions (model as independent)
         self._critic_require_grad(False)
-        min_q = self._min_q(obs_n, act, use_target=False)
+        extrns_q = self._min_q(obs_n, act, use_target=False)
+        if self.rnd:
+            intrns_q = self.intrinsic_critic.network(self._q_input(obs_n, act))
+            intrns_q = self.cfg.rnd_rew_weight * intrns_q
+            q = extrns_q + intrns_q
+        else:
+            q = extrns_q
         self._critic_require_grad(True)
-        self.alpha, policy_loss, alpha_loss = self.policy.train_one_step(min_q, log_prob)
+        self.alpha, policy_loss, alpha_loss = self.policy.train_one_step(q, log_prob)
         self.writer.add_scalar("alpha/alpha", self.alpha, self.global_step)
         self.writer.add_scalar("alpha/alpha_loss", alpha_loss, self.global_step)
         self.writer.add_scalar("policy/policy_loss", policy_loss, self.global_step)
         self.writer.add_scalar("policy/entropy_term", -log_prob.mean(), self.global_step)
-        self.writer.add_scalar("policy/q_term", min_q.mean(), self.global_step)
+        self.writer.add_scalar("policy/q_term", q.mean(), self.global_step)
+        if self.rnd:
+            self.writer.add_scalar("policy/intrinsic_q", intrns_q.mean(), self.global_step)
+            self.writer.add_scalar("policy/extrinsic_q", extrns_q.mean(), self.global_step)
 
     def _min_q(self, obs, act, use_target):
         q_input = self._q_input(obs, act)
@@ -375,8 +432,7 @@ class SACRunner(BaseRunner):
         else:
             q1 = self.q1.network(q_input)
             q2 = self.q2.network(q_input)
-        q = torch.where(q1 <= q2, q1, q2)
-        return q
+        return torch.minimum(q1, q2)
 
     def _compute_q_targ(
             self,
@@ -397,6 +453,19 @@ class SACRunner(BaseRunner):
 
         return rew_scaled + self.cfg.gamma * (1 - dones.int()) * (q - self.alpha * log_prob)
 
+
+    def _compute_intrns_q_targ(
+            self,
+            rew_scaled,
+            next_obs_n,
+    ):
+        with torch.no_grad():
+            dist = self.policy.dist(next_obs_n)
+            next_act = dist.sample()
+            q_input = self._q_input(next_obs_n, next_act)
+            q = self.intrinsic_critic.target(q_input)
+        return rew_scaled + self.cfg.rnd_gamma * q
+
     def _init_networks(self):
         self.policy = self._init_policy()
         self.q1 = self._init_q()
@@ -413,6 +482,10 @@ class SACRunner(BaseRunner):
             "next_obs": torch.zeros(self.max_ep_len, self.num_envs, self.obs_shape, device=self.device),
             "term": torch.zeros(self.max_ep_len, self.num_envs, 1, dtype=torch.bool, device=self.device),
         }
+        if self.rnd:
+            her_trajectories.update({
+                "rnd_obs": torch.zeros(self.max_ep_len, self.num_envs, self.rnd_obs_shape, device=self.device)
+            })
         ep_ptr = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         return her_trajectories, ep_ptr
 
@@ -441,14 +514,19 @@ class SACRunner(BaseRunner):
         )
 
     def _init_buffer(self):
-        return VectorizedReplayBuffer(
-            tensor_desc={
+        tensor_desc = {
                 "obs": (self.obs_shape, torch.float32),
                 "next_obs": (self.obs_shape, torch.float32),
                 "action": (self.action_shape, torch.float32),
                 "rew": (1, torch.float32),
                 "done": (1, torch.bool),
-            },
+            }
+        if self.cfg.use_rnd:
+            tensor_desc.update({
+                "rnd_obs": (self.rnd_obs_shape, torch.float32)
+            })
+        return VectorizedReplayBuffer(
+            tensor_desc=tensor_desc,
             capacity=self.cfg.replay_buffer_size,
             device=self._env.device
         )
@@ -509,10 +587,12 @@ class SACRunnerCfg:
     # intrinsic rewards
     use_rnd: bool = MISSING
     rnd_cfg: RNDCfg = MISSING
-    rnd_value_hidden_layers: list = MISSING
-    rnd_value_lr: float = MISSING
-    rnd_rew_weight = MISSING
-    rnd_rew_clip = MISSING  # 0.0 = disabled
+    rnd_critic_hidden_layers: list = MISSING
+    rnd_critic_lr: float = MISSING
+    rnd_rew_weight: float = MISSING
+    rnd_rew_clip: float = MISSING  # 0.0 = disabled
+    rnd_critic_tau: float = MISSING
+    rnd_gamma: float = MISSING
 
     # reward scaling
     reward_scaling: bool = MISSING
