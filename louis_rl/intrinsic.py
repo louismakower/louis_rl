@@ -19,14 +19,6 @@ class RND:
         self.loss = nn.MSELoss(reduction='none')
         self.optim = optim.AdamW(self.predictor.parameters(), lr=self.cfg.lr)
         self.obs_norm = RunningMeanStd(insize=(self.obs_dim,)).to(self.device)
-    
-    def set_train(self):
-        self.predictor.train()
-        self.obs_norm.train()
-
-    def set_eval(self):
-        self.predictor.eval()
-        self.obs_norm.eval()
 
     def _init_networks(self):
         self.target = build_mlp(
@@ -41,19 +33,26 @@ class RND:
             device=self.device
         )
 
+    def _prepoc_obs(self, obs):
+        obs_n = self.obs_norm(obs)
+        obs_c = torch.clamp(obs_n, -self.cfg.obs_clip, self.cfg.obs_clip)
+        return obs_c
+
     @torch.no_grad()
     def get_intrinsic_rew(self, obs):
-        self.set_eval()
-        obs_n = self.obs_norm(obs)
-        pred = self.predictor(obs_n)
-        target = self.target(obs_n)
+        self.predictor.eval()
+        self.obs_norm.eval()
+        obs = self._prepoc_obs(obs)
+        pred = self.predictor(obs)
+        target = self.target(obs)
         return self.loss(pred, target).mean(dim=-1, keepdim=True)  # average over prediction dimension
 
     def train_one_step(self, obs):
-        self.set_train()
-        x_n = self.obs_norm(obs)
-        pred = self.predictor(x_n)
-        y = self.target(x_n)
+        self.predictor.train()
+        self.obs_norm.train()
+        obs = self._prepoc_obs(obs)
+        pred = self.predictor(obs)
+        y = self.target(obs)
         loss = self.loss(pred, y).mean(dim=-1, keepdim=True)
         mean_loss = loss.mean()
         
@@ -62,6 +61,11 @@ class RND:
         self.optim.step()
 
         return loss.detach()
+    
+    def init_obs_norm(self, obs):
+        # this should be initialised during warmup with random actions
+        self.obs_norm.train()
+        self.obs_norm(obs)
 
 @dataclass
 class RNDCfg:
@@ -70,3 +74,4 @@ class RNDCfg:
     predictor_hidden_layers: list[int] = MISSING
 
     lr: float = MISSING
+    obs_clip: float = MISSING
