@@ -63,8 +63,7 @@ class SACRunner(BaseRunner):
                 tau=self.cfg.rnd_critic_tau,
                 device=self.device,
             )
-            # TODO: this should normalise returns not rewards
-            self.intrinsic_rew_norm = RunningMeanStd(insize=(1,), norm_only=True).to(self._env.device)
+            self.intrinsic_rew_norm = RewardNormaliser(self.cfg.rnd_gamma, G_max=self.cfg.rnd_G_max, device=self.device)
         else:
             self.rnd = None
             self.intrinsic_critic = None
@@ -100,18 +99,14 @@ class SACRunner(BaseRunner):
         self.q2.network.eval()
         self.policy.network.eval()
         self.obs_norm.eval()
-        if self.rnd:
-            # train/eval mode for RND is handled inside RND
-            self.intrinsic_rew_norm.eval()
+        # train/eval mode for RND is handled inside RND
 
     def _set_train(self):
         self.q1.network.train()
         self.q2.network.train()
         self.policy.network.train()
         self.obs_norm.train()
-        if self.rnd:
-            # train/eval mode for RND is handled inside RND
-            self.intrinsic_rew_norm.train()
+        # train/eval mode for RND is handled inside RND
 
     def _get_checkpoint(self) -> dict:
         return {
@@ -158,9 +153,10 @@ class SACRunner(BaseRunner):
 
             self.global_step += self.num_envs
 
-            # get intrinsic rewards, just to log
+            # get intrinsic rewards, to log and update stats
             if self.rnd:
-                intrns_rew = self.rnd.get_intrinsic_rew(next_obs["rnd"])
+                intrns_rew = self.rnd.get_intrinsic_rew(next_obs["rnd"], update_norm_stats=True).squeeze(-1)
+                self.intrinsic_rew_norm.update_reward_stats(intrns_rew, torch.zeros_like(intrns_rew), torch.zeros_like(intrns_rew))
                 self.writer.add_scalar("rewards/intrinsic_mean", intrns_rew.mean(), self.global_step)
 
             self.writer.add_scalar("rewards/extrinsic_mean", ex_rew.mean(), self.global_step)
@@ -183,9 +179,6 @@ class SACRunner(BaseRunner):
                 buffer_data.update({
                     "rnd_obs": rnd_next
                 })
-                # initialise the obs normaliser parameters during warmup
-                if self.warmup:
-                    self.rnd.init_obs_norm(rnd_next)
             self.buffer.add(buffer_data)
 
             if self.her:
@@ -311,11 +304,12 @@ class SACRunner(BaseRunner):
         # RND
         if self.rnd:
             # separate observation normalisation handled inside RND
-            b_intrns_rew = self.rnd.get_intrinsic_rew(b_rnd_obs)
-            b_intrns_rew_scaled = self.intrinsic_rew_norm(b_intrns_rew)
+            b_intrns_rew = self.rnd.get_intrinsic_rew(b_rnd_obs, update_norm_stats=False)
+            b_intrns_rew_scaled, intrns_rew_scale = self.intrinsic_rew_norm.normalise_rewards(b_intrns_rew)
             b_intrns_rew_scaled = torch.clamp(b_intrns_rew_scaled, -self.cfg.rnd_rew_clip, self.cfg.rnd_rew_clip) if self.cfg.rnd_rew_clip > 0 else b_intrns_rew_scaled
             self.writer.add_scalar("rnd/intrinsic_rew", b_intrns_rew.mean(), self.global_step)
             self.writer.add_scalar("rnd/intrinsic_rew_scaled", b_intrns_rew_scaled.mean(), self.global_step)
+            self.writer.add_scalar("rnd/intrinsic_rew_scale", intrns_rew_scale, self.global_step)
             intrns_q_targ = self._compute_intrns_q_targ(b_intrns_rew_scaled, b_next_obs_n)
         else:
             intrns_q_targ = None
@@ -471,6 +465,8 @@ class SACRunner(BaseRunner):
             next_act = dist.sample()
             q_input = self._q_input(next_obs_n, next_act)
             q = self.intrinsic_critic.target(q_input)
+        
+        # don't include entropy in intrinsic Q - it's in the extrinsic one
         return rew_scaled + self.cfg.rnd_gamma * q
 
     def _init_networks(self):
@@ -600,6 +596,7 @@ class SACRunnerCfg:
     rnd_rew_clip: float = MISSING  # 0.0 = disabled
     rnd_critic_tau: float = MISSING
     rnd_gamma: float = MISSING
+    rnd_G_max: float = MISSING
 
     # reward scaling
     reward_scaling: bool = MISSING
