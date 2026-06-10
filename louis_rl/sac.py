@@ -158,6 +158,11 @@ class SACRunner(BaseRunner):
 
             self.global_step += self.num_envs
 
+            # get intrinsic rewards, just to log
+            if self.rnd:
+                intrns_rew = self.rnd.get_intrinsic_rew(next_obs["rnd"])
+                self.writer.add_scalar("rewards/intrinsic_mean", intrns_rew.mean(), self.global_step)
+
             self.writer.add_scalar("rewards/extrinsic_mean", ex_rew.mean(), self.global_step)
             self.writer.add_scalar("terminations/term", term.float().mean(), self.global_step)
             self.writer.add_scalar("terminations/timeout", timeout.float().mean(), self.global_step)

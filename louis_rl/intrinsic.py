@@ -14,7 +14,8 @@ class RND:
         self.cfg: RNDCfg = cfg
         self.device = device
         self.obs_dim = obs_dim
-        self.pred_shape = self.cfg.pred_shape
+        self.pred_shape = cfg.pred_shape
+        self.use_frac = cfg.use_frac
         self._init_networks()
         self.loss = nn.MSELoss(reduction='none')
         self.optim = optim.AdamW(self.predictor.parameters(), lr=self.cfg.lr)
@@ -48,6 +49,10 @@ class RND:
         return self.loss(pred, target).mean(dim=-1, keepdim=True)  # average over prediction dimension
 
     def train_one_step(self, obs):
+        if self.use_frac < 1.:
+            n_obs = obs.shape[0]
+            use_filter = torch.rand((n_obs,)) < self.use_frac
+            obs = obs[use_filter]
         self.predictor.train()
         self.obs_norm.train()
         obs = self._prepoc_obs(obs)
@@ -75,3 +80,4 @@ class RNDCfg:
 
     lr: float = MISSING
     obs_clip: float = MISSING
+    use_frac: float = MISSING
