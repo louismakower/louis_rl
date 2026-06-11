@@ -9,6 +9,7 @@ from torch import optim
 from .base_runner import BaseRunner
 from .vec_env import VecEnv
 from .networks import build_mlp
+from .intrinsic import RND, RNDCfg
 
 class PPORunner(BaseRunner):
     def __init__(
@@ -21,7 +22,7 @@ class PPORunner(BaseRunner):
         self._env = env
         self.device = self._env.device
         self.num_envs = self._env.num_envs
-        self.cfg = cfg
+        self.cfg: PPORunnerCfg = cfg
         self.act_dim = self._env.action_space.shape[0]
         self._init_obs()
         self._init_networks()
@@ -32,12 +33,31 @@ class PPORunner(BaseRunner):
         self.term_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, dtype=torch.bool, device=self.device)
         self.timeout_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, dtype=torch.bool, device=self.device)
         self.log_prob_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, device=self.device)
-        self.V_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, device=self.device)
         self.writer = SummaryWriter(log_dir=log_dir)
-
+        self._init_RND()
+            
         self.cov_mat = torch.diag(
             torch.full(size=(self.act_dim,), fill_value=0.5),
         ).to(device=self.device)
+
+    def _init_RND(self):
+        if self.cfg.rnd is not None:
+            self.rnd_obs_shape = self._env.observation_space["rnd"].shape[0]
+            self.rnd = RND(self.cfg.rnd, self.device, obs_dim=self.rnd_obs_shape)
+            self.intrinsic_V = build_mlp(
+                sizes=(self.obs_shape, *self.cfg.rnd_V_hidden_layers, 1),
+                device=self.device
+            )
+            self.intrinsic_optim = optim.Adam(self.intrinsic_V.parameters(), lr=self.cfg.rnd_V_lr)
+            self.intrinsic_rew_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, device=self.device)
+            self.intrinsic_next_obs_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, self.rnd_obs_shape, device=self.device)
+        else:
+            self.rnd_obs_shape = None
+            self.rnd = None
+            self.intrinsic_V = None
+            self.intrinsic_optim = None
+            self.intrinsic_rew_buf = None
+            self.intrinsic_next_obs_buf = None
 
     def _init_obs(self):
         self.policy_obs_dim = self._env.observation_space["policy"].shape[0]
@@ -66,11 +86,28 @@ class PPORunner(BaseRunner):
             with torch.no_grad():
                 rtg = self.calc_rtg()  # (N, L)
                 advantages = self.calc_adv(rtg).detach()  # (N, L)
+            self.writer.add_scalar("advantages/extrinsic", advantages.mean(), self.global_step)
+
+            # add instrinsic advantages
+            if self.rnd is not None:
+                with torch.no_grad():
+                    intrns_rtg = self.calc_intrinsic_rtg()
+                    intrins_adv = self.calc_intrinsic_adv(intrns_rtg).detach()
+                    intrins_adv = intrins_adv * self.cfg.rnd_weight
+                    self.writer.add_scalar("advantages/intrinsic", intrins_adv.mean(), self.global_step)
+                    advantages = advantages + intrins_adv
+                    self.writer.add_scalar("advantages/total", advantages.mean(), self.global_step)
+            
             for _ in range(self.cfg.num_policy_grad_steps):
                 policy_loss = self.policy_step(advantages)
             self.writer.add_scalar("policy/policy_loss", policy_loss, self.global_step)
             for _ in range(self.cfg.num_v_grad_steps):
                 v_loss = self.value_step(rtg)
+            if self.rnd is not None:
+                for _ in range(self.cfg.rnd_v_grad_steps):
+                    rnd_loss = self.rnd_step(intrns_rtg)
+                self.writer.add_scalar("rnd/rnd_v_loss", rnd_loss, self.global_step)
+                self.rnd.train_one_step(self.intrinsic_next_obs_buf.reshape(-1, self.rnd_obs_shape))  # reshape so use_frac samples transitions not envs
             self.writer.add_scalar("value/v_loss", v_loss, self.global_step)
             all_keys = set(k for d in ep_infos for k in d)
             for key in all_keys:
@@ -119,10 +156,43 @@ class PPORunner(BaseRunner):
         loss.backward()
         self.v_optim.step()
         return loss.item()
+    
+    def rnd_step(self, intrinsic_rtg):
+        intrinsic_V = self.intrinsic_V(self.obs_buf).squeeze(-1)
+        loss = self.mse(intrinsic_V, intrinsic_rtg)
+
+        self.intrinsic_optim.zero_grad()
+        loss.backward()
+        self.intrinsic_optim.step()
+        return loss.item()
 
     def calc_adv(self, rtg):
         val = self.v(self.obs_buf).squeeze(-1)  # (N, L)
         return rtg - val
+    
+    def calc_intrinsic_adv(self, intrinsic_rtg):
+        val = self.intrinsic_V(self.obs_buf).squeeze(-1)
+        return intrinsic_rtg - val
+
+    def calc_intrinsic_rtg(self):
+        rtgs = torch.zeros_like(self.intrinsic_rew_buf)
+        for step_idx in range(self.intrinsic_rew_buf.shape[1]-1, -1, -1):
+            next_obs = self.next_obs_buf[:, step_idx]
+
+            rew = self.intrinsic_rew_buf[:, step_idx]
+
+            # on last step, always bootstrap
+            if step_idx == self.intrinsic_rew_buf.shape[1]-1:
+                with torch.no_grad():
+                    bootstrap_val = self.intrinsic_V(next_obs).squeeze(-1)  # (N,)
+                discounted_rew = bootstrap_val
+            # on other steps, use RTG
+            else:
+                discounted_rew = rtgs[:, step_idx+1]
+
+            rtgs[:, step_idx] = rew + self.cfg.rnd_gamma*discounted_rew
+
+        return rtgs
 
     def calc_rtg(self):
         rtgs = torch.zeros_like(self.rew_buf)
@@ -130,19 +200,18 @@ class PPORunner(BaseRunner):
             next_obs = self.next_obs_buf[:, step_idx]
 
             rew = self.rew_buf[:, step_idx]
+            with torch.no_grad():
+                bootstrap_val = self.v(next_obs).squeeze(-1)  # (N,)
 
+            # on last step, always bootstrap unless a termination
             if step_idx == self.rew_buf.shape[1]-1:
-                # bootstrap next reward if not terminated
-                with torch.no_grad():
-                    bootstrap_val = self.v(next_obs).squeeze(-1)  # (N,)
-                    discounted_rew = torch.where(self.timeout_buf[:, step_idx], self.V_buf[:, step_idx], bootstrap_val)
+                    # on termination, future reward is 0, otherwise bootstrap
+                    discounted_rew = torch.where(self.term_buf[:, step_idx], 0, bootstrap_val)
+            # on other steps, bootstrap only on timeout
             else:
-                # use RTG from next timestep or bootstrap if timeout
-                # (i.e. use the value of the last state we have)
-                discounted_rew = torch.where(self.timeout_buf[:, step_idx], self.V_buf[:, step_idx], rtgs[:, step_idx+1])
+                discounted_rew = torch.where(self.timeout_buf[:, step_idx], bootstrap_val, rtgs[:, step_idx+1])
+                discounted_rew = torch.where(self.term_buf[:, step_idx], 0, discounted_rew)
 
-            # no discounted reward if terminated
-            discounted_rew = torch.where(self.term_buf[:, step_idx], 0, discounted_rew)
             rtgs[:, step_idx] = rew + self.cfg.gamma*discounted_rew
 
         return rtgs
@@ -156,24 +225,35 @@ class PPORunner(BaseRunner):
 
     def rollout(self, obs, step):
         ep_infos = []
-        if isinstance(obs, dict):
-            obs = self.add_goal_obs(obs)
         for step_idx in range(self.cfg.steps_per_rollout):
+            if isinstance(obs, dict):
+                obs = self.add_goal_obs(obs)
             with torch.no_grad():
                 act, log_prob = self.get_action(obs)
             next_obs, rew, term, timeout, extras = self._env.step(act)
+            resetted = term | timeout
             self.global_step += self.num_envs
-            next_obs = self.add_goal_obs(next_obs)
+            
+            if self.rnd:
+                # handle terminal RND obs and add to buffer
+                terminal_rnd = extras["terminal_obs"]["rnd"]
+                rnd_next_obs = torch.where(resetted.unsqueeze(-1), terminal_rnd, next_obs["rnd"])
+                intrns_rew = self.rnd.get_intrinsic_rew(rnd_next_obs, update_norm_stats=True)
+                self.intrinsic_rew_buf[:, step_idx] = intrns_rew.squeeze(-1)
+                self.intrinsic_next_obs_buf[:, step_idx] = rnd_next_obs
+            
+            # handle terminal observations
+            next_obs_t = self.add_goal_obs(next_obs)
+            terminal_t = self.add_goal_obs(extras["terminal_obs"])
+            next_obs_for_buf = torch.where(resetted.unsqueeze(-1), terminal_t, next_obs_t)
 
             self.obs_buf[:, step_idx] = obs
-            self.next_obs_buf[:, step_idx] = next_obs
+            self.next_obs_buf[:, step_idx] = next_obs_for_buf
             self.rew_buf[:, step_idx] = rew
             self.term_buf[:, step_idx] = term
             self.timeout_buf[:, step_idx] = timeout
             self.log_prob_buf[:, step_idx] = log_prob
             self.act_buf[:, step_idx] = act
-            with torch.no_grad():
-                self.V_buf[:, step_idx] = self.v(obs).squeeze(-1)
             obs = next_obs
 
             self.writer.add_scalar("rewards/mean", rew.mean().item(), self.global_step)
@@ -203,4 +283,13 @@ class PPORunnerCfg:
     eps: float = MISSING
 
     save_interval: int = MISSING
+    
+    # RND
+    rnd: None | RNDCfg = MISSING
+    rnd_V_hidden_layers: list[int] = MISSING
+    rnd_gamma: float = MISSING
+    rnd_v_grad_steps: int = MISSING
+    rnd_V_lr: float = MISSING
+    rnd_weight: float = MISSING
+    
     algo_name: str = "ppo"
