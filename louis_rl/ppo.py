@@ -9,7 +9,7 @@ from torch import optim
 from .base_runner import BaseRunner
 from .vec_env import VecEnv
 from .networks import build_mlp
-from .intrinsic import RND, RNDCfg
+from .intrinsic import IntrinsicCfg, IntrinsicModule
 
 class PPORunner(BaseRunner):
     def __init__(
@@ -34,26 +34,26 @@ class PPORunner(BaseRunner):
         self.timeout_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, dtype=torch.bool, device=self.device)
         self.log_prob_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, device=self.device)
         self.writer = SummaryWriter(log_dir=log_dir)
-        self._init_RND()
+        self._init_intrinsic()
             
         self.cov_mat = torch.diag(
             torch.full(size=(self.act_dim,), fill_value=0.5),
         ).to(device=self.device)
 
-    def _init_RND(self):
-        if self.cfg.rnd is not None:
-            self.rnd_obs_shape = self._env.observation_space["rnd"].shape[0]
-            self.rnd = RND(self.cfg.rnd, self.device, obs_dim=self.rnd_obs_shape)
+    def _init_intrinsic(self):
+        if self.cfg.intrinsic is not None:
+            self.intrinsic_obs_shape = self._env.observation_space["rnd"].shape[0]
+            self.intrinsic = IntrinsicModule.create(self.cfg.intrinsic, self.device, obs_dim=self.intrinsic_obs_shape)
             self.intrinsic_V = build_mlp(
-                sizes=(self.obs_shape, *self.cfg.rnd_V_hidden_layers, 1),
+                sizes=(self.obs_shape, *self.cfg.intrinsic_V_hidden_layers, 1),
                 device=self.device
             )
-            self.intrinsic_optim = optim.Adam(self.intrinsic_V.parameters(), lr=self.cfg.rnd_V_lr)
+            self.intrinsic_optim = optim.Adam(self.intrinsic_V.parameters(), lr=self.cfg.intrinsic_V_lr)
             self.intrinsic_rew_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, device=self.device)
-            self.intrinsic_next_obs_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, self.rnd_obs_shape, device=self.device)
+            self.intrinsic_next_obs_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, self.intrinsic_obs_shape, device=self.device)
         else:
-            self.rnd_obs_shape = None
-            self.rnd = None
+            self.intrinsic_obs_shape = None
+            self.intrinsic = None
             self.intrinsic_V = None
             self.intrinsic_optim = None
             self.intrinsic_rew_buf = None
@@ -89,11 +89,11 @@ class PPORunner(BaseRunner):
             self.writer.add_scalar("advantages/extrinsic", advantages.mean(), self.global_step)
 
             # add instrinsic advantages
-            if self.rnd is not None:
+            if self.intrinsic is not None:
                 with torch.no_grad():
                     intrns_rtg = self.calc_intrinsic_rtg()
                     intrins_adv = self.calc_intrinsic_adv(intrns_rtg).detach()
-                    intrins_adv = intrins_adv * self.cfg.rnd_weight
+                    intrins_adv = intrins_adv * self.cfg.intrinsic_weight
                     self.writer.add_scalar("advantages/intrinsic", intrins_adv.mean(), self.global_step)
                     advantages = advantages + intrins_adv
                     self.writer.add_scalar("advantages/total", advantages.mean(), self.global_step)
@@ -103,11 +103,11 @@ class PPORunner(BaseRunner):
             self.writer.add_scalar("policy/policy_loss", policy_loss, self.global_step)
             for _ in range(self.cfg.num_v_grad_steps):
                 v_loss = self.value_step(rtg)
-            if self.rnd is not None:
-                for _ in range(self.cfg.rnd_v_grad_steps):
-                    rnd_loss = self.rnd_step(intrns_rtg)
-                self.writer.add_scalar("rnd/rnd_v_loss", rnd_loss, self.global_step)
-                self.rnd.train_one_step(self.intrinsic_next_obs_buf.reshape(-1, self.rnd_obs_shape))  # reshape so use_frac samples transitions not envs
+            if self.intrinsic is not None:
+                for _ in range(self.cfg.intrinsic_v_grad_steps):
+                    intrinsic_loss = self.intrinsic_step(intrns_rtg)
+                self.writer.add_scalar("intrinsic/intrinsic_v_loss", intrinsic_loss, self.global_step)
+                self.intrinsic.train_one_step(self.intrinsic_next_obs_buf.reshape(-1, self.intrinsic_obs_shape))  # reshape so use_frac samples transitions not envs
             self.writer.add_scalar("value/v_loss", v_loss, self.global_step)
             all_keys = set(k for d in ep_infos for k in d)
             for key in all_keys:
@@ -157,7 +157,7 @@ class PPORunner(BaseRunner):
         self.v_optim.step()
         return loss.item()
     
-    def rnd_step(self, intrinsic_rtg):
+    def intrinsic_step(self, intrinsic_rtg):
         intrinsic_V = self.intrinsic_V(self.obs_buf).squeeze(-1)
         loss = self.mse(intrinsic_V, intrinsic_rtg)
 
@@ -190,7 +190,7 @@ class PPORunner(BaseRunner):
             else:
                 discounted_rew = rtgs[:, step_idx+1]
 
-            rtgs[:, step_idx] = rew + self.cfg.rnd_gamma*discounted_rew
+            rtgs[:, step_idx] = rew + self.cfg.intrinsic_gamma*discounted_rew
 
         return rtgs
 
@@ -234,13 +234,13 @@ class PPORunner(BaseRunner):
             resetted = term | timeout
             self.global_step += self.num_envs
             
-            if self.rnd:
+            if self.intrinsic:
                 # handle terminal RND obs and add to buffer
-                terminal_rnd = extras["terminal_obs"]["rnd"]
-                rnd_next_obs = torch.where(resetted.unsqueeze(-1), terminal_rnd, next_obs["rnd"])
-                intrns_rew = self.rnd.get_intrinsic_rew(rnd_next_obs, update_norm_stats=True)
+                terminal_intrinsic = extras["terminal_obs"]["rnd"]
+                intrinsic_next_obs = torch.where(resetted.unsqueeze(-1), terminal_intrinsic, next_obs["rnd"])
+                intrns_rew = self.intrinsic.get_intrinsic_rew(intrinsic_next_obs, update_norm_stats=True)
                 self.intrinsic_rew_buf[:, step_idx] = intrns_rew.squeeze(-1)
-                self.intrinsic_next_obs_buf[:, step_idx] = rnd_next_obs
+                self.intrinsic_next_obs_buf[:, step_idx] = intrinsic_next_obs
             
             # handle terminal observations
             next_obs_t = self.add_goal_obs(next_obs)
@@ -285,11 +285,11 @@ class PPORunnerCfg:
     save_interval: int = MISSING
     
     # RND
-    rnd: None | RNDCfg = MISSING
-    rnd_V_hidden_layers: list[int] = MISSING
-    rnd_gamma: float = MISSING
-    rnd_v_grad_steps: int = MISSING
-    rnd_V_lr: float = MISSING
-    rnd_weight: float = MISSING
+    intrinsic: None | IntrinsicCfg = MISSING
+    intrinsic_V_hidden_layers: list[int] = MISSING
+    intrinsic_gamma: float = MISSING
+    intrinsic_v_grad_steps: int = MISSING
+    intrinsic_V_lr: float = MISSING
+    intrinsic_weight: float = MISSING
     
     algo_name: str = "ppo"
