@@ -138,7 +138,7 @@ class Counts(IntrinsicModule):
 
         upper_lims = []
         for idx, num_steps in enumerate(num_el):
-            res = self.cfg.resolutions[idx]
+            res = self.cfg.resolutions[idx] if isinstance(self.cfg.resolutions, list) else self.cfg.resolutions
             x = mins[idx]
             row = []
             for n in range(1, num_steps + 1):
@@ -161,12 +161,13 @@ class Counts(IntrinsicModule):
             flat_idx += row_idx * strides[d]
         self.counts[idx] = self.counts[idx] + 1
 
-@dataclass
+@dataclass(kw_only=True)
 class IntrinsicCfg(ABC):
-    type: Literal["rnd", "counts"]
+    type: Literal["rnd", "counts"] = MISSING
 
-@dataclass
+@dataclass(kw_only=True)
 class RNDCfg(IntrinsicCfg):
+    type: Literal["rnd"] = "rnd"
     pred_dim: int = MISSING
     target_hidden_layers: list[int] = MISSING
     predictor_hidden_layers: list[int] = MISSING
@@ -175,8 +176,9 @@ class RNDCfg(IntrinsicCfg):
     obs_clip: float = MISSING
     use_frac: float = MISSING
 
-@dataclass
+@dataclass(kw_only=True)
 class CountsCfg(IntrinsicCfg):
+    type: Literal["counts"] = "counts"
     limits: list[tuple[float]] = MISSING
     resolutions: float | list[float] = MISSING
 
