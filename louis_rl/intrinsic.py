@@ -132,7 +132,7 @@ class Counts(IntrinsicModule):
         else:
             num_el = tuple(int(d // (r-eps)) for d, r in zip(dists, self.cfg.resolutions))
 
-        print(num_el)
+        print(f"Counts initialised with shape: {num_el}")
         counts = torch.ones(size=num_el, device=self.device, dtype=torch.int32)
         mins = [x[0] for x in self.cfg.limits]
 
