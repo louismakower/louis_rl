@@ -21,9 +21,6 @@ class VectorizedReplayBuffer:
         size: int
             Max number of transitions to store in the buffer. When the buffer
             overflows the old memories are dropped.
-        See Also
-        --------
-        ReplayBuffer.__init__
         """
 
         self.device = device

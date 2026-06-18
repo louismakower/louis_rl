@@ -1,5 +1,5 @@
-from .ppo import PPORunner
-from .sac import SACRunner
+from .algos.ppo import PPORunner
+from .algos.sac import SACRunner
 
 class RLRunner:
     def __init__(self, env, cfg, log_dir):

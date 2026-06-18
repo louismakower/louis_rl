@@ -7,9 +7,9 @@ import torch.nn as nn
 from torch import optim
 
 from .base_runner import BaseRunner
-from .vec_env import VecEnv
-from .networks import build_mlp
-from .intrinsic import IntrinsicCfg, IntrinsicModule
+from louis_rl.vec_env import VecEnv
+from louis_rl.utils.networks import build_mlp
+from louis_rl.implementations.intrinsic import IntrinsicCfg, IntrinsicModule
 
 class PPORunner(BaseRunner):
     def __init__(

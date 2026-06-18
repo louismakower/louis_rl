@@ -6,13 +6,13 @@ import torch
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
 from torch.utils.tensorboard import SummaryWriter
 
-from .networks import Policy, Q
-from .reward_normaliser import RewardNormaliser
+from louis_rl.utils.networks import Policy, Q
+from louis_rl.utils.reward_normaliser import RewardNormaliser
 from .base_runner import BaseRunner
-from .experience import VectorizedReplayBuffer
-from .her import HERCfg
-from .vec_env import VecEnv
-from .intrinsic import IntrinsicModule, IntrinsicCfg
+from louis_rl.utils.experience import VectorizedReplayBuffer
+from louis_rl.implementations.her import HERCfg
+from louis_rl.vec_env import VecEnv
+from louis_rl.implementations.intrinsic import IntrinsicModule, IntrinsicCfg
 
 def _recurse_obs(item, fn):
     new_dict = {}

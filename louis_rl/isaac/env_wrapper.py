@@ -2,7 +2,7 @@ from __future__ import annotations
 import torch
 from gymnasium.spaces import Dict as DictSpace
 
-from ..vec_env import SpaceInfo
+from louis_rl.vec_env import SpaceInfo
 from .terminal_obs_env import ReturnTerminalManagerBasedRLEnv
 
 

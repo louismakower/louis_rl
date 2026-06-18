@@ -8,7 +8,7 @@ from typing import Literal
 from abc import ABC, abstractmethod
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
 
-from .networks import build_mlp
+from louis_rl.utils.networks import build_mlp
 
 class IntrinsicModule(ABC):
     @classmethod
@@ -96,6 +96,7 @@ class RND(IntrinsicModule):
 
         return loss.detach()
 
+
 class Counts(IntrinsicModule):
     def __init__(self, cfg: CountsCfg, device, obs_dim):
         self.cfg: CountsCfg = cfg
@@ -110,7 +111,7 @@ class Counts(IntrinsicModule):
         return rew
     
     def _counts_to_rew(self, counts):
-        return (1 / counts).unsqueeze(-1)  # return (N, 1)
+        return (1 / torch.sqrt(counts)).unsqueeze(-1)  # return (N, 1)
     
     def _obs_to_idx(self, obs):
         # obs is (N, obs_dim)
@@ -161,9 +162,11 @@ class Counts(IntrinsicModule):
             flat_idx += row_idx * strides[d]
         self.counts[idx] = self.counts[idx] + 1
 
+
 @dataclass(kw_only=True)
 class IntrinsicCfg(ABC):
     type: Literal["rnd", "counts"] = MISSING
+
 
 @dataclass(kw_only=True)
 class RNDCfg(IntrinsicCfg):
@@ -175,6 +178,7 @@ class RNDCfg(IntrinsicCfg):
     lr: float = MISSING
     obs_clip: float = MISSING
     use_frac: float = MISSING
+
 
 @dataclass(kw_only=True)
 class CountsCfg(IntrinsicCfg):
