@@ -20,6 +20,9 @@ class VecEnv(Protocol):
     def action_space(self) -> SpaceInfo: ...
     @property
     def observation_space(self) -> dict[str, SpaceInfo]: ...
+    
+    # per-env step count within the current episode, shape (num_envs,)
+    ep_counters: torch.Tensor
 
     def step(self, action: torch.Tensor) -> tuple[dict, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """
