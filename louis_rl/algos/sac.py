@@ -282,7 +282,7 @@ class SACRunner(BaseRunner):
             self.her.ep_ptr + 1,
         )
 
-    def train_batch(self):
+    def train_batch(self, log: bool = True):
         sample = self.buffer.sample(self.cfg.batch_size)
         b_obs, b_act, b_extrns_rew, b_next_obs, b_dones = sample["obs"], sample["action"], sample["rew"], sample["next_obs"], sample["done"]
         if self.intrinsic:
@@ -307,21 +307,23 @@ class SACRunner(BaseRunner):
             b_intrns_rew = self.intrinsic.get_intrinsic_rew(b_intrinsic_obs, update_norm_stats=False)
             b_intrns_rew_scaled, intrns_rew_scale = self.intrinsic_rew_norm.normalise_rewards(b_intrns_rew)
             b_intrns_rew_scaled = torch.clamp(b_intrns_rew_scaled, -self.cfg.intrinsic_rew_clip, self.cfg.intrinsic_rew_clip) if self.cfg.intrinsic_rew_clip > 0 else b_intrns_rew_scaled
-            self.writer.add_scalar("intrinsic/intrinsic_rew", b_intrns_rew.mean(), self.global_step)
-            self.writer.add_scalar("intrinsic/intrinsic_rew_scaled", b_intrns_rew_scaled.mean(), self.global_step)
-            self.writer.add_scalar("intrinsic/intrinsic_rew_scale", intrns_rew_scale, self.global_step)
+            if log:
+                self.writer.add_scalar("intrinsic/intrinsic_rew", b_intrns_rew.mean(), self.global_step)
+                self.writer.add_scalar("intrinsic/intrinsic_rew_scaled", b_intrns_rew_scaled.mean(), self.global_step)
+                self.writer.add_scalar("intrinsic/intrinsic_rew_scale", intrns_rew_scale, self.global_step)
             intrns_q_targ = self._compute_intrns_q_targ(b_intrns_rew_scaled, b_next_obs_n)
         else:
             intrns_q_targ = None
 
         # bookeeping
-        self.writer.add_scalar("q_target/reward_scale", rew_scale, self.global_step)
-        self.writer.add_scalar("q_target/extrinsic_rew", b_extrns_rew.mean(), self.global_step)
-        self.writer.add_scalar("q_target/extrinsic_rew_std", b_extrns_rew.std(), self.global_step)
-        self.writer.add_scalar("q_target/extrinsic_rew_scaled", b_extrns_rew_scaled.mean(), self.global_step)
-        self.writer.add_scalar("q_target/extrinsic_rew_scaled_std", b_extrns_rew_scaled.std(), self.global_step)
-        self.writer.add_scalar("critic/q_target", ext_q_targ.mean(), self.global_step)
-        if self.log_histograms:
+        if log:
+            self.writer.add_scalar("q_target/reward_scale", rew_scale, self.global_step)
+            self.writer.add_scalar("q_target/extrinsic_rew", b_extrns_rew.mean(), self.global_step)
+            self.writer.add_scalar("q_target/extrinsic_rew_std", b_extrns_rew.std(), self.global_step)
+            self.writer.add_scalar("q_target/extrinsic_rew_scaled", b_extrns_rew_scaled.mean(), self.global_step)
+            self.writer.add_scalar("q_target/extrinsic_rew_scaled_std", b_extrns_rew_scaled.std(), self.global_step)
+            self.writer.add_scalar("critic/q_target", ext_q_targ.mean(), self.global_step)
+        if log and self.log_histograms:
             for i in range(0, b_act.shape[-1], 1):
                 self.writer.add_histogram(f"buffer/act_dim_{i}", b_act[:, i], self.global_step)
             for i in range(b_obs.shape[-1]):
@@ -331,29 +333,33 @@ class SACRunner(BaseRunner):
         q_input = self._q_input(b_obs_n, b_act)
         q1_loss = self.q1.train_one_step(q_input, ext_q_targ)
         q2_loss = self.q2.train_one_step(q_input, ext_q_targ)
-        self.writer.add_scalar("critic/q1_loss", q1_loss, self.global_step)
-        self.writer.add_scalar("critic/q2_loss", q2_loss, self.global_step)
-        
+        if log:
+            self.writer.add_scalar("critic/q1_loss", q1_loss, self.global_step)
+            self.writer.add_scalar("critic/q2_loss", q2_loss, self.global_step)
+
         # train RND network
         if self.intrinsic:
             self.intrinsic.train_one_step(b_intrinsic_obs)
             intrinsic_value_loss = self.intrinsic_critic.train_one_step(q_input, intrns_q_targ)
-            self.writer.add_scalar("intrinsic/critic_loss", intrinsic_value_loss, self.global_step)
+            if log:
+                self.writer.add_scalar("intrinsic/critic_loss", intrinsic_value_loss, self.global_step)
 
         # train policy
-        self._train_onestep_policy(b_obs_n)
+        self._train_onestep_policy(b_obs_n, log=log)
 
         # update critic target networks
         self.q1.update_target()
         self.q2.update_target()
-        q1_targ_diff = self.q1.target_network_diff(q_input)
-        q2_targ_diff = self.q2.target_network_diff(q_input)
-        self.writer.add_scalar("critic/q1_targ_diff", q1_targ_diff, self.global_step)
-        self.writer.add_scalar("critic/q2_targ_diff", q2_targ_diff, self.global_step)
+        if log:
+            q1_targ_diff = self.q1.target_network_diff(q_input)
+            q2_targ_diff = self.q2.target_network_diff(q_input)
+            self.writer.add_scalar("critic/q1_targ_diff", q1_targ_diff, self.global_step)
+            self.writer.add_scalar("critic/q2_targ_diff", q2_targ_diff, self.global_step)
         if self.intrinsic:
             self.intrinsic_critic.update_target()
-            intrinsic_critic_diff = self.intrinsic_critic.target_network_diff(q_input)
-            self.writer.add_scalar("intrinsic/targ_diff", intrinsic_critic_diff, self.global_step)
+            if log:
+                intrinsic_critic_diff = self.intrinsic_critic.target_network_diff(q_input)
+                self.writer.add_scalar("intrinsic/targ_diff", intrinsic_critic_diff, self.global_step)
 
     def learn(self):
         obs, extras = self._env.reset()
@@ -384,7 +390,8 @@ class SACRunner(BaseRunner):
 
                 self._set_train()
                 for train_step in range(self.cfg.num_train_updates):
-                    self.train_batch()
+                    # only log on the last update
+                    self.train_batch(log=train_step == self.cfg.num_train_updates - 1)
 
             if not self.warmup and iter_step % self.cfg.save_interval == 0:
                 self.save_checkpoint()
@@ -400,7 +407,7 @@ class SACRunner(BaseRunner):
             for p in self.intrinsic_critic.network.parameters():
                 p.requires_grad = t
 
-    def _train_onestep_policy(self, obs_n):
+    def _train_onestep_policy(self, obs_n, log: bool = True):
         dist = self.policy.dist(obs_n)
         act = dist.rsample()
         log_prob = dist.log_prob(act).sum(dim=-1, keepdim=True)  # sum over action dimensions (model as independent)
@@ -417,14 +424,15 @@ class SACRunner(BaseRunner):
         
         self._critics_require_grad(True)
         self.alpha, policy_loss, alpha_loss = self.policy.train_one_step(q, log_prob)
-        self.writer.add_scalar("alpha/alpha", self.alpha, self.global_step)
-        self.writer.add_scalar("alpha/alpha_loss", alpha_loss, self.global_step)
-        self.writer.add_scalar("policy/policy_loss", policy_loss, self.global_step)
-        self.writer.add_scalar("policy/entropy_term", -log_prob.mean(), self.global_step)
-        self.writer.add_scalar("policy/q_term", q.mean(), self.global_step)
-        if self.intrinsic:
-            self.writer.add_scalar("policy/intrinsic_q", intrns_q.mean(), self.global_step)
-            self.writer.add_scalar("policy/extrinsic_q", extrns_q.mean(), self.global_step)
+        if log:
+            self.writer.add_scalar("alpha/alpha", self.alpha, self.global_step)
+            self.writer.add_scalar("alpha/alpha_loss", alpha_loss, self.global_step)
+            self.writer.add_scalar("policy/policy_loss", policy_loss, self.global_step)
+            self.writer.add_scalar("policy/entropy_term", -log_prob.mean(), self.global_step)
+            self.writer.add_scalar("policy/q_term", q.mean(), self.global_step)
+            if self.intrinsic:
+                self.writer.add_scalar("policy/intrinsic_q", intrns_q.mean(), self.global_step)
+                self.writer.add_scalar("policy/extrinsic_q", extrns_q.mean(), self.global_step)
 
     def _min_q(self, obs, act, use_target):
         q_input = self._q_input(obs, act)
