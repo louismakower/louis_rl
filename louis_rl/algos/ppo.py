@@ -80,6 +80,7 @@ class PPORunner(BaseRunner):
 
     def learn(self):
         obs, extras = self._env.reset()
+        self._env.randomise_ep_counters()
         step = 0
         for iteration_idx in range(self.cfg.num_iterations):
             next_obs, step, ep_infos = self.rollout(obs, step)
