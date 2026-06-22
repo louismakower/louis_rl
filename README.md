@@ -1,6 +1,6 @@
 # louis_rl
 
-A deep reinforcement learning library built on PyTorch, designed for use with goal-conditioned vectorised environments (e.g. Isaac Lab, simple_envs).
+A deep reinforcement learning library built on PyTorch, designed for use with goal-conditioned vectorised environments (e.g. [Isaac Lab](https://github.com/isaac-sim/IsaacLab) or my own [simple_envs](https://github.com/louismakower/simple_envs)).
 
 ## Algorithms
 
