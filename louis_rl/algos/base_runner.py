@@ -31,7 +31,8 @@ class BaseRunner(ABC):
         self._load_checkpoint(state)
     
     def add_goal_obs(self, obs: dict):
-        policy_obs = obs["policy"]
+        policy_obs = [v for k, v in obs.items() if "policy" in k]
+        policy_obs = torch.cat(policy_obs, dim=-1)
         goal_obs = obs.get("goal")
         if goal_obs is not None:
             return torch.cat([policy_obs, *goal_obs.values()], dim=-1)

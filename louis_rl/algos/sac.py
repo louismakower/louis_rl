@@ -102,7 +102,10 @@ class SACRunner(BaseRunner):
         print(f"[INFO]: UTD ratio is currently: {utd:.3f}")
 
     def _init_obs(self):
-        self.policy_obs_dim = self._env.observation_space["policy"].shape[0]
+        self.policy_obs_dim = sum(
+            self._env.observation_space[k].shape[0]
+            for k in self._env.observation_space if "policy" in k
+        )
         goal_obs = self._env.observation_space.get("goal")
         goal_obs_dim = sum(goal_obs[k].shape[0] for k in goal_obs) if goal_obs else 0
         self.obs_shape = self.policy_obs_dim + goal_obs_dim
