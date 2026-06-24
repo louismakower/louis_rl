@@ -29,8 +29,10 @@ class SACRunner(BaseRunner):
             env: VecEnv,
             cfg: SACRunnerCfg,
             log_dir: str,
+            inference_only: bool = False,
     ):
         super().__init__(log_dir)
+        self.inference_only = inference_only
         self._env: VecEnv = env
         self.cfg: SACRunnerCfg = cfg
         self.alpha = cfg.alpha_init
@@ -43,7 +45,19 @@ class SACRunner(BaseRunner):
         print(f"[SAC]: Target entropy set to {self.target_entropy}")
 
         self._init_obs()
-        
+
+        if self.inference_only:
+            # Only the policy + obs normaliser are needed to act. Skip every
+            # training-only allocation: the replay buffer, HER/RND buffers and
+            # the tensorboard writer.
+            self.her = None
+            self.intrinsic = None
+            self.intrinsic_critic = None
+            self._init_networks()
+            self.writer = None
+            self.log_histograms = False
+            return
+
         # HER
         if self.cfg.her_cfg:
             self.her = cfg.her_cfg
@@ -481,6 +495,9 @@ class SACRunner(BaseRunner):
         self.policy = self._init_policy()
         self.q1 = self._init_q()
         self.q2 = self._init_q()
+        if self.inference_only:
+            self.buffer = None
+            return
         self.buffer = self._init_buffer()
         if self.her:
             self.her.trajectories, self.her.ep_ptr = self._init_her()

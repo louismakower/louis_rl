@@ -2,11 +2,11 @@ from .algos.ppo import PPORunner
 from .algos.sac import SACRunner
 
 class RLRunner:
-    def __init__(self, env, cfg, log_dir):
+    def __init__(self, env, cfg, log_dir, inference_only=False):
         if cfg.algo_name.lower() == "ppo":
-            self.runner = PPORunner(env, cfg, log_dir)
+            self.runner = PPORunner(env, cfg, log_dir, inference_only=inference_only)
         elif cfg.algo_name.lower() == "sac":
-            self.runner = SACRunner(env, cfg, log_dir)
+            self.runner = SACRunner(env, cfg, log_dir, inference_only=inference_only)
 
     def learn(self):
         self.runner.learn()

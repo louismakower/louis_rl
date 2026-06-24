@@ -17,8 +17,10 @@ class PPORunner(BaseRunner):
             env: VecEnv,
             cfg: PPORunnerCfg,
             log_dir: str,
+            inference_only: bool = False,
     ):
         super().__init__(log_dir)
+        self.inference_only = inference_only
         self._env = env
         self.device = self._env.device
         self.num_envs = self._env.num_envs
@@ -26,6 +28,10 @@ class PPORunner(BaseRunner):
         self.act_dim = self._env.action_space.shape[0]
         self._init_obs()
         self._init_networks()
+        if self.inference_only:
+            self.writer = None
+            self.intrinsic = None
+            return
         self.rew_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, device=self.device)
         self.act_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, self.act_dim, device=self.device)
         self.obs_buf = torch.zeros(self.num_envs, self.cfg.steps_per_rollout, self.obs_shape, device=self.device)
