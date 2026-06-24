@@ -171,11 +171,13 @@ class SACRunner(BaseRunner):
             if self.intrinsic:
                 intrns_rew = self.intrinsic.get_intrinsic_rew(next_obs["rnd"], update_norm_stats=True).squeeze(-1)
                 self.intrinsic_rew_norm.update_reward_stats(intrns_rew, torch.zeros_like(intrns_rew), torch.zeros_like(intrns_rew))
-                self.writer.add_scalar("rewards/intrinsic_mean", intrns_rew.mean(), self.global_step)
+                if self.should_log:
+                    self.writer.add_scalar("rewards/intrinsic_mean", intrns_rew.mean(), self.global_step)
 
-            self.writer.add_scalar("rewards/extrinsic_mean", ex_rew.mean(), self.global_step)
-            self.writer.add_scalar("terminations/term", term.float().mean(), self.global_step)
-            self.writer.add_scalar("terminations/timeout", timeout.float().mean(), self.global_step)
+            if self.should_log:
+                self.writer.add_scalar("rewards/extrinsic_mean", ex_rew.mean(), self.global_step)
+                self.writer.add_scalar("terminations/term", term.float().mean(), self.global_step)
+                self.writer.add_scalar("terminations/timeout", timeout.float().mean(), self.global_step)
 
             done = term.unsqueeze(1)  # ie DO bootstrap on timeout, DON'T on termination
             # buffer contains transitions which have the RAW observations
@@ -211,8 +213,9 @@ class SACRunner(BaseRunner):
 
             obs = next_obs
 
-        replay_buffer_state = self.buffer.capacity if self.buffer.full else self.buffer.idx
-        self.writer.add_scalar("buffer/replay_buffer_state", replay_buffer_state, self.global_step)
+        if self.should_log:
+            replay_buffer_state = self.buffer.capacity if self.buffer.full else self.buffer.idx
+            self.writer.add_scalar("buffer/replay_buffer_state", replay_buffer_state, self.global_step)
         ep_infos.append(extras.get("log", {}))
         return obs
 
@@ -285,7 +288,7 @@ class SACRunner(BaseRunner):
                         "rnd_obs": new_transitions["rnd_obs"],
                     })
                 self.buffer.add(buffer_data)
-            if new_transitions["reward"].shape[0] != 0:
+            if self.should_log and new_transitions["reward"].shape[0] != 0:
                 self.writer.add_histogram("her/distances", new_transitions["distances"], self.global_step)
                 self.writer.add_histogram("her/rewards", new_transitions["reward"], self.global_step)
                 self.writer.add_scalar("her/her_ave_rew", new_transitions["reward"].mean(), self.global_step)
@@ -313,7 +316,7 @@ class SACRunner(BaseRunner):
         else:
             b_extrns_rew_scaled, rew_scale = b_extrns_rew, 1.0
         b_extrns_rew_scaled = torch.clamp(b_extrns_rew_scaled, -self.cfg.reward_clip, self.cfg.reward_clip) if self.cfg.reward_clip > 0 else b_extrns_rew_scaled
-        ext_q_targ = self._compute_q_targ(b_extrns_rew_scaled, b_next_obs_n, b_dones)
+        ext_q_targ = self._compute_q_targ(b_extrns_rew_scaled, b_next_obs_n, b_dones, log=log)
 
         # RND
         if self.intrinsic:
@@ -381,6 +384,7 @@ class SACRunner(BaseRunner):
         self.warmup = True
         ep_infos = []
         for iter_step in range(self.cfg.max_steps // self.cfg.steps_per_iter):
+            self.should_log = iter_step % self.cfg.log_every == 0
             obs = self.rollout_and_add_to_buffer(
                 obs=obs,
                 ep_infos=ep_infos,
@@ -395,17 +399,20 @@ class SACRunner(BaseRunner):
                 print(f"[SAC] Warming up, {self.global_step} out of {self.cfg.warmup_transitions} ({100*self.global_step / self.cfg.warmup_transitions:.1f}%)")
 
             if not self.warmup:
-                all_keys = set(k for d in ep_infos for k in d)
-                for key in all_keys:
-                    vals = [d[key] for d in ep_infos if key in d]
-                    mean_val = sum(float(v) for v in vals) / len(vals)
-                    self.writer.add_scalar(key, mean_val, self.global_step)
-                ep_infos = []
+                # aggregate episode infos over the logging window, then flush
+                if self.should_log:
+                    all_keys = set(k for d in ep_infos for k in d)
+                    for key in all_keys:
+                        vals = [d[key] for d in ep_infos if key in d]
+                        mean_val = sum(float(v) for v in vals) / len(vals)
+                        self.writer.add_scalar(key, mean_val, self.global_step)
+                    ep_infos = []
 
                 self._set_train()
                 for train_step in range(self.cfg.num_train_updates):
-                    # only log on the last update
-                    self.train_batch(log=train_step == self.cfg.num_train_updates - 1)
+                    # only log on the last update of a logging iteration
+                    last_update = train_step == self.cfg.num_train_updates - 1
+                    self.train_batch(log=self.should_log and last_update)
 
             if not self.warmup and iter_step % self.cfg.save_interval == 0:
                 self.save_checkpoint()
@@ -463,6 +470,7 @@ class SACRunner(BaseRunner):
             rew_scaled,
             next_obs_n,
             dones,
+            log: bool = True,
     ):
         with torch.no_grad():
             dist = self.policy.dist(next_obs_n)
@@ -470,9 +478,10 @@ class SACRunner(BaseRunner):
             log_prob = dist.log_prob(next_act).sum(-1, keepdim=True)  # sum over action dimensions (model as independent)
             q = self._min_q(next_obs_n, next_act, use_target=True)
 
-            self.writer.add_scalar("q_target/log_prob", log_prob.mean(), self.global_step)
-            self.writer.add_scalar("q_target/q", q.mean(), self.global_step)
-            self.writer.add_scalar("q_target/entropy_bonus", -(self.alpha * log_prob).mean(), self.global_step)
+            if log:
+                self.writer.add_scalar("q_target/log_prob", log_prob.mean(), self.global_step)
+                self.writer.add_scalar("q_target/q", q.mean(), self.global_step)
+                self.writer.add_scalar("q_target/entropy_bonus", -(self.alpha * log_prob).mean(), self.global_step)
 
 
         return rew_scaled + self.cfg.gamma * (1 - dones.int()) * (q - self.alpha * log_prob)
@@ -635,3 +644,4 @@ class SACRunnerCfg:
     algo_name: str = "sac"
 
     log_histograms: bool = False
+    log_every: int = 10  # write to tensorboard every N iterations
