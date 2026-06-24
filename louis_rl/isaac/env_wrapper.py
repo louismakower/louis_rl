@@ -1,9 +1,9 @@
 from __future__ import annotations
 import torch
 from gymnasium.spaces import Dict as DictSpace
+from isaaclab.envs import ManagerBasedRLEnv
 
 from louis_rl.vec_env import SpaceInfo
-from .terminal_obs_env import ReturnTerminalManagerBasedRLEnv
 
 
 def _convert_space(space):
@@ -32,7 +32,7 @@ class IsaacEnvWrapper:
         )
     """
 
-    def __init__(self, env: ReturnTerminalManagerBasedRLEnv, add_terminal_obs=True):
+    def __init__(self, env: ManagerBasedRLEnv, add_terminal_obs=True):
         self._env = env
         self.add_terminal_obs = add_terminal_obs
         # Live visualisers (e.g. value-vs-distance); each gets maybe_update() per step.
@@ -43,7 +43,7 @@ class IsaacEnvWrapper:
         return self._env.unwrapped.device
 
     @property
-    def unwrapped(self) -> ReturnTerminalManagerBasedRLEnv:
+    def unwrapped(self) -> ManagerBasedRLEnv:
         return self._env.unwrapped
 
     @property
