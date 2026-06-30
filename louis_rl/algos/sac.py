@@ -126,14 +126,23 @@ class SACRunner(BaseRunner):
         # train/eval mode for RND is handled inside RND
 
     def _get_checkpoint(self) -> dict:
-        return {
+        state = {
             "policy": self.policy.network.state_dict(),
             "obs_norm": self.obs_norm.state_dict(),
+            "q1": self.q1.network.state_dict(),
+            "q2": self.q2.network.state_dict(),
         }
+        if self.intrinsic_critic is not None:
+            state["intrinsic_critic"] = self.intrinsic_critic.network.state_dict()
+        return state
 
     def _load_checkpoint(self, state: dict):
         self.policy.network.load_state_dict(state["policy"])
         self.obs_norm.load_state_dict(state["obs_norm"])
+        self.q1.network.load_state_dict(state["q1"])
+        self.q2.network.load_state_dict(state["q2"])
+        if self.intrinsic_critic is not None:
+            self.intrinsic_critic.network.load_state_dict(state["intrinsic_critic"])
 
     def get_deterministic_action(self, obs):
         self._set_eval()
