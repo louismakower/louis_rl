@@ -340,6 +340,8 @@ class SACRunner(BaseRunner):
                 self.writer.add_scalar("intrinsic/intrinsic_rew", b_intrns_rew.mean(), self.global_step)
                 self.writer.add_scalar("intrinsic/intrinsic_rew_scaled", b_intrns_rew_scaled.mean(), self.global_step)
                 self.writer.add_scalar("intrinsic/intrinsic_rew_scale", intrns_rew_scale, self.global_step)
+                for k, v in self.intrinsic.extra_logs().items():
+                    self.writer.add_scalar(k, v, self.global_step)
             intrns_q_targ = self._compute_intrns_q_targ(b_intrns_rew_scaled, b_next_obs_n)
         else:
             intrns_q_targ = None

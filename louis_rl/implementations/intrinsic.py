@@ -18,6 +18,8 @@ class IntrinsicModule(ABC):
             return Counts(cfg, device, obs_dim)
         elif cfg.type == "rnd":
             return RND(cfg, device, obs_dim)
+        elif cfg.type == "stable_counts":
+            return StableCounts(cfg, device, obs_dim)
         raise NotImplementedError(f"Unknown intrinsic type: {cfg.type}")
 
     @abstractmethod
@@ -27,6 +29,10 @@ class IntrinsicModule(ABC):
     @abstractmethod
     def train_one_step(self, obs):
         pass
+
+    def extra_logs(self) -> dict:
+        """Optional extra scalars to log each iteration (name -> value). Default: none."""
+        return {}
 
     def _subsample(self, obs):
         if self.use_frac >= 1.:
@@ -131,9 +137,104 @@ class Counts(IntrinsicModule):
         self.counts.index_put_(idx, ones, accumulate=True)
 
 
+class StableCounts(Counts):
+    """Counts, but a cell only counts / rewards when reached *stably*:
+    ``‖obs[:, stable_dims]‖ < stable_threshold`` (e.g. stable_dims = velocity)."""
+
+    def __init__(self, cfg: StableCountsCfg, device, obs_dim):
+        super().__init__(cfg, device, obs_dim)
+        self.cfg: StableCountsCfg = cfg
+        self.stable_dims = torch.tensor(cfg.stable_dims, device=device, dtype=torch.long)
+        self.stable_threshold = cfg.stable_threshold
+        self.ungated_weight = cfg.ungated_weight
+
+        # self.counts (from Counts) counts stable visits only. visit_counts counts
+        # every visit, feeding the optional dense exploration term (ungated_weight).
+        self.visit_counts = torch.ones(self.grid.shape, device=device, dtype=torch.int32)
+
+        # per-cell archive of the most-stable binning feature seen; inf == unreached
+        self.n_bin = len(self.grid.shape)
+        self.best_metric = torch.full((self.grid.n_cells,), float("inf"), device=device)
+        self.snapshots = torch.zeros(self.grid.n_cells, self.n_bin, device=device)
+
+    def _stability(self, obs):
+        metric = obs[:, self.stable_dims].norm(dim=-1)  # 0 == perfectly stable
+        return metric, metric < self.stable_threshold
+
+    def get_intrinsic_rew(self, obs, update_norm_stats=False):
+        idx = self.grid.to_index(obs)
+        _, stable = self._stability(obs)
+        rew = stable.float() / torch.sqrt(self.counts[idx].float())  # gated: reward for stopping somewhere novel
+        if self.ungated_weight > 0:
+            # small dense term on raw visitation so moving toward unexplored cells pays too
+            rew = rew + self.ungated_weight / torch.sqrt(self.visit_counts[idx].float())
+        return rew.unsqueeze(-1)
+
+    def train_one_step(self, obs):
+        obs = self._subsample(obs)
+        if obs.shape[0] == 0:
+            return
+        # every visit feeds the dense exploration count
+        v_idx = self.grid.to_index(obs)
+        self.visit_counts.index_put_(v_idx, torch.ones(obs.shape[0], dtype=self.visit_counts.dtype, device=self.device), accumulate=True)
+
+        metric, stable = self._stability(obs)
+        if not bool(stable.any()):
+            return
+        obs, metric = obs[stable], metric[stable]  # count / archive stable visits only
+        idx = self.grid.to_index(obs)
+        self.counts.index_put_(idx, torch.ones(obs.shape[0], dtype=self.counts.dtype, device=self.device), accumulate=True)
+        self._archive(obs, metric)
+
+    def _archive(self, obs, metric):
+        # keep the lowest-metric feature per cell; collapse duplicate cells in the
+        # batch to their best row first, then overwrite only if we beat the stored one
+        cells = self.grid.to_flat(obs)
+        n, num = self.grid.n_cells, obs.shape[0]
+        batch_best = torch.full((n,), float("inf"), device=self.device)
+        batch_best.scatter_reduce_(0, cells, metric, reduce="amin", include_self=True)
+        is_winner = metric == batch_best[cells]
+        rows = torch.arange(num, device=self.device)
+        tie_break = torch.where(is_winner, rows, torch.full_like(rows, num))
+        win_row = torch.full((n,), num, dtype=torch.long, device=self.device)
+        win_row.scatter_reduce_(0, cells, tie_break, reduce="amin", include_self=True)
+
+        present = (win_row < num).nonzero(as_tuple=True)[0]
+        win_row = win_row[present]
+        better = metric[win_row] < self.best_metric[present]
+        upd_cells, upd_rows = present[better], win_row[better]
+        self.best_metric[upd_cells] = metric[upd_rows]
+        self.snapshots[upd_cells] = obs[upd_rows, : self.n_bin]
+
+    @property
+    def occupied(self):
+        return torch.isfinite(self.best_metric)
+
+    @property
+    def n_stable(self) -> int:
+        return int(self.occupied.sum())
+
+    @property
+    def coverage(self) -> float:
+        return self.n_stable / self.grid.n_cells  # denominator includes unreachable cells
+
+    def stable_states(self):
+        # (M, n_bin) archived features, one per stably-reached cell, for reuse as starts/goals
+        return self.snapshots[self.occupied]
+
+    def extra_logs(self) -> dict:
+        return {"intrinsic/coverage": self.coverage, "intrinsic/n_stable": self.n_stable}
+
+    def save_stable_states(self, path):
+        torch.save(
+            {"features": self.stable_states().cpu(), "metric": self.best_metric[self.occupied].cpu()},
+            path,
+        )
+
+
 @dataclass(kw_only=True)
 class IntrinsicCfg(ABC):
-    type: Literal["rnd", "counts"] = MISSING
+    type: Literal["rnd", "counts", "stable_counts"] = MISSING
 
 
 @dataclass(kw_only=True)
@@ -154,6 +255,14 @@ class CountsCfg(IntrinsicCfg):
     limits: list[tuple[float]] = MISSING
     resolutions: float | list[float] = MISSING
     use_frac: float = MISSING
+
+
+@dataclass(kw_only=True)
+class StableCountsCfg(CountsCfg):
+    type: Literal["stable_counts"] = "stable_counts"
+    stable_dims: list[int] = MISSING  # obs indices whose norm defines "stable"
+    stable_threshold: float = MISSING  # stable iff ‖obs[:, stable_dims]‖ < this
+    ungated_weight: float = 0.0  # >0 adds a dense visitation-novelty term (0 = pure gated)
 
 if __name__ == "__main__":
     cfg = CountsCfg(

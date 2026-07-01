@@ -118,6 +118,8 @@ class PPORunner(BaseRunner):
                     intrinsic_loss = self.intrinsic_step(intrns_rtg)
                 self.writer.add_scalar("intrinsic/intrinsic_v_loss", intrinsic_loss, self.global_step)
                 self.intrinsic.train_one_step(self.intrinsic_next_obs_buf.reshape(-1, self.intrinsic_obs_shape))  # reshape so use_frac samples transitions not envs
+                for k, v in self.intrinsic.extra_logs().items():
+                    self.writer.add_scalar(k, v, self.global_step)
             self.writer.add_scalar("value/v_loss", v_loss, self.global_step)
             all_keys = set(k for d in ep_infos for k in d)
             for key in all_keys:
