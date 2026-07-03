@@ -181,10 +181,31 @@ class SACRunner(BaseRunner):
 
             # get intrinsic rewards, to log and update stats
             if self.intrinsic:
+                terminal_intrinsic = extras["terminal_obs"]["rnd"]
+                intrinsic_next = torch.where(resetted.unsqueeze(-1), terminal_intrinsic, next_obs["rnd"])
+
                 intrns_rew = self.intrinsic.get_intrinsic_rew(next_obs["rnd"], update_norm_stats=True).squeeze(-1)
                 self.intrinsic_rew_norm.update_reward_stats(intrns_rew, torch.zeros_like(intrns_rew), torch.zeros_like(intrns_rew))
                 if self.should_log:
                     self.writer.add_scalar("rewards/intrinsic_mean", intrns_rew.mean(), self.global_step)
+
+                # observe with this step's reach before restore, so the archive never re-observes its own target
+                archive = getattr(self.intrinsic, "archive", None)
+                full_snapshot = None
+                if archive is not None:
+                    current_snapshot = self._env.snapshot_state()
+                    full_snapshot = torch.where(resetted.unsqueeze(-1), extras["terminal_snapshot"], current_snapshot)
+                self.intrinsic.observe(intrinsic_next, full_snapshot)
+
+                if archive is not None and self.cfg.archive_reset_frac > 0 and resetted.any():
+                    to_restore = resetted & (torch.rand(self.num_envs, device=self.device) < self.cfg.archive_reset_frac)
+                    if to_restore.any():
+                        selected = archive.select(int(to_restore.sum()))
+                        if selected is not None:
+                            snaps, _ = selected
+                            next_obs = self._env.restore_state(env_ids=to_restore, snapshots=snaps)
+                            if self.should_log:
+                                self.writer.add_scalar("archive/n_restored", to_restore.float().sum(), self.global_step)
 
             if self.should_log:
                 self.writer.add_scalar("rewards/extrinsic_mean", ex_rew.mean(), self.global_step)
@@ -202,8 +223,6 @@ class SACRunner(BaseRunner):
                 "done": done
             }
             if self.intrinsic:
-                terminal_intrinsic = extras["terminal_obs"]["rnd"]
-                intrinsic_next = torch.where(resetted.unsqueeze(-1), terminal_intrinsic, next_obs["rnd"])
                 buffer_data.update({
                     "rnd_obs": intrinsic_next
                 })
@@ -659,3 +678,4 @@ class SACRunnerCfg:
 
     log_histograms: bool = False
     log_every: int = 10  # write to tensorboard every N iterations
+    archive_reset_frac: float = 0.0  # fraction of resetting envs to redirect to an archived stable state (0 = disabled; requires SnapshotVecEnv)

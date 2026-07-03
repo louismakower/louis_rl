@@ -4,12 +4,13 @@ import torch.optim as optim
 import torch
 
 from dataclasses import dataclass, MISSING
-from typing import Literal
+from typing import Callable, Literal
 from abc import ABC, abstractmethod
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
 
 from louis_rl.utils.networks import build_mlp
 from louis_rl.utils.grid import CellGrid
+from louis_rl.utils.archive import StableArchive, norm_threshold_stability
 
 class IntrinsicModule(ABC):
     @classmethod
@@ -28,17 +29,21 @@ class IntrinsicModule(ABC):
 
     @abstractmethod
     def train_one_step(self, obs):
+        """Gradient-based training step. No-op for modules with no learnable parameters, use observe() instead"""
+        pass
+
+    def observe(self, obs, snapshot=None):
+        """Non-gradient bookkeeping (ie stats updates), called every step"""
         pass
 
     def extra_logs(self) -> dict:
         """Optional extra scalars to log each iteration (name -> value). Default: none."""
         return {}
 
-    def _subsample(self, obs):
+    def _subsample_mask(self, n: int) -> torch.Tensor:
         if self.use_frac >= 1.:
-            return obs
-        use_filter = torch.rand((obs.shape[0],), device=obs.device) < self.use_frac
-        return obs[use_filter]
+            return torch.ones(n, dtype=torch.bool, device=self.device)
+        return torch.rand((n,), device=self.device) < self.use_frac
 
 
 class RND(IntrinsicModule):
@@ -73,7 +78,7 @@ class RND(IntrinsicModule):
             return obs_c
         else:
             return obs_n
-        
+
 
     @torch.no_grad()
     def get_intrinsic_rew(self, obs, update_norm_stats=False):
@@ -88,7 +93,8 @@ class RND(IntrinsicModule):
         return self.loss(pred, target).mean(dim=-1, keepdim=True)  # average over prediction dimension
 
     def train_one_step(self, obs):
-        obs = self._subsample(obs)
+        mask = self._subsample_mask(obs.shape[0])
+        obs = obs[mask]
         if obs.shape[0] == 0:
             # if use_frac removed all observations, don't try training
             return 0.
@@ -99,7 +105,7 @@ class RND(IntrinsicModule):
         y = self.target(obs)
         loss = self.loss(pred, y).mean(dim=-1, keepdim=True)
         mean_loss = loss.mean()
-        
+
         self.optim.zero_grad()
         mean_loss.backward()
         self.optim.step()
@@ -125,8 +131,9 @@ class Counts(IntrinsicModule):
     def _counts_to_rew(self, counts):
         return (1 / torch.sqrt(counts)).unsqueeze(-1)  # return (N, 1)
 
-    def train_one_step(self, obs):
-        obs = self._subsample(obs)
+    def observe(self, obs, snapshot=None):
+        mask = self._subsample_mask(obs.shape[0])
+        obs = obs[mask]
         if obs.shape[0] == 0:
             # if use_frac removed all observations, don't count anything
             return
@@ -136,98 +143,68 @@ class Counts(IntrinsicModule):
         ones = torch.ones(obs.shape[0], dtype=self.counts.dtype, device=self.device)
         self.counts.index_put_(idx, ones, accumulate=True)
 
+    def train_one_step(self, obs):
+        pass
 
-class StableCounts(Counts):
-    """Counts, but a cell only counts / rewards when reached *stably*:
-    ``‖obs[:, stable_dims]‖ < stable_threshold`` (e.g. stable_dims = velocity)."""
+
+class StableCounts(IntrinsicModule):
+    """Counts, but a cell only counts / rewards when reached *stably*
+    Uses a user-provided stability_fn callable. Requires env with snapshots/resets"""
 
     def __init__(self, cfg: StableCountsCfg, device, obs_dim):
-        super().__init__(cfg, device, obs_dim)
         self.cfg: StableCountsCfg = cfg
-        self.stable_dims = torch.tensor(cfg.stable_dims, device=device, dtype=torch.long)
-        self.stable_threshold = cfg.stable_threshold
+        self.device = device
+        self.use_frac = cfg.use_frac
         self.ungated_weight = cfg.ungated_weight
-
-        # self.counts (from Counts) counts stable visits only. visit_counts counts
-        # every visit, feeding the optional dense exploration term (ungated_weight).
-        self.visit_counts = torch.ones(self.grid.shape, device=device, dtype=torch.int32)
-
-        # per-cell archive of the most-stable binning feature seen; inf == unreached
-        self.n_bin = len(self.grid.shape)
-        self.best_metric = torch.full((self.grid.n_cells,), float("inf"), device=device)
-        self.snapshots = torch.zeros(self.grid.n_cells, self.n_bin, device=device)
-
-    def _stability(self, obs):
-        metric = obs[:, self.stable_dims].norm(dim=-1)  # 0 == perfectly stable
-        return metric, metric < self.stable_threshold
+        self.archive = StableArchive(
+            limits=cfg.limits,
+            resolutions=cfg.resolutions,
+            snapshot_dim=cfg.snapshot_dim,
+            device=device,
+            stability_fn=cfg.stability_fn,
+            count_exponent=cfg.count_exponent,
+        )
 
     def get_intrinsic_rew(self, obs, update_norm_stats=False):
-        idx = self.grid.to_index(obs)
-        _, stable = self._stability(obs)
-        rew = stable.float() / torch.sqrt(self.counts[idx].float())  # gated: reward for stopping somewhere novel
-        if self.ungated_weight > 0:
-            # small dense term on raw visitation so moving toward unexplored cells pays too
-            rew = rew + self.ungated_weight / torch.sqrt(self.visit_counts[idx].float())
-        return rew.unsqueeze(-1)
+        cells = self.archive.grid.to_flat(obs[:, : self.archive.grid.n_bin])
+        _, stable = self.archive.stability_fn(obs)
+        return self.archive.reward(cells, stable, self.ungated_weight)
 
-    def train_one_step(self, obs):
-        obs = self._subsample(obs)
+    def observe(self, obs, snapshot):
+        """Update the archive with a batch of (features, snapshots)"""
+        mask = self._subsample_mask(obs.shape[0])
+        obs, snapshot = obs[mask], snapshot[mask]
         if obs.shape[0] == 0:
             return
-        # every visit feeds the dense exploration count
-        v_idx = self.grid.to_index(obs)
-        self.visit_counts.index_put_(v_idx, torch.ones(obs.shape[0], dtype=self.visit_counts.dtype, device=self.device), accumulate=True)
+        self.archive.observe(obs, snapshot)
 
-        metric, stable = self._stability(obs)
-        if not bool(stable.any()):
-            return
-        obs, metric = obs[stable], metric[stable]  # count / archive stable visits only
-        idx = self.grid.to_index(obs)
-        self.counts.index_put_(idx, torch.ones(obs.shape[0], dtype=self.counts.dtype, device=self.device), accumulate=True)
-        self._archive(obs, metric)
-
-    def _archive(self, obs, metric):
-        # keep the lowest-metric feature per cell; collapse duplicate cells in the
-        # batch to their best row first, then overwrite only if we beat the stored one
-        cells = self.grid.to_flat(obs)
-        n, num = self.grid.n_cells, obs.shape[0]
-        batch_best = torch.full((n,), float("inf"), device=self.device)
-        batch_best.scatter_reduce_(0, cells, metric, reduce="amin", include_self=True)
-        is_winner = metric == batch_best[cells]
-        rows = torch.arange(num, device=self.device)
-        tie_break = torch.where(is_winner, rows, torch.full_like(rows, num))
-        win_row = torch.full((n,), num, dtype=torch.long, device=self.device)
-        win_row.scatter_reduce_(0, cells, tie_break, reduce="amin", include_self=True)
-
-        present = (win_row < num).nonzero(as_tuple=True)[0]
-        win_row = win_row[present]
-        better = metric[win_row] < self.best_metric[present]
-        upd_cells, upd_rows = present[better], win_row[better]
-        self.best_metric[upd_cells] = metric[upd_rows]
-        self.snapshots[upd_cells] = obs[upd_rows, : self.n_bin]
-
-    @property
-    def occupied(self):
-        return torch.isfinite(self.best_metric)
-
-    @property
-    def n_stable(self) -> int:
-        return int(self.occupied.sum())
+    def train_one_step(self, obs):
+        """Noting to trian, no-op"""
+        pass
 
     @property
     def coverage(self) -> float:
-        return self.n_stable / self.grid.n_cells  # denominator includes unreachable cells
+        return self.archive.coverage
+
+    @property
+    def n_stable(self) -> int:
+        return self.archive.n_stable
 
     def stable_states(self):
-        # (M, n_bin) archived features, one per stably-reached cell, for reuse as starts/goals
-        return self.snapshots[self.occupied]
+        # (M, snapshot_dim) archived snapshots, one per stably-reached cell
+        return self.archive.stable_snapshots[self.archive.occupied]
 
     def extra_logs(self) -> dict:
-        return {"intrinsic/coverage": self.coverage, "intrinsic/n_stable": self.n_stable}
+        return {
+            "intrinsic/coverage": self.coverage,
+            "intrinsic/n_stable": self.n_stable,
+            "intrinsic/n_visited": self.archive.n_visited,
+            "intrinsic/visited_coverage": self.archive.visited_coverage,
+        }
 
     def save_stable_states(self, path):
         torch.save(
-            {"features": self.stable_states().cpu(), "metric": self.best_metric[self.occupied].cpu()},
+            {"snapshots": self.stable_states().cpu(), "score": self.archive.best_score[self.archive.occupied].cpu()},
             path,
         )
 
@@ -260,8 +237,9 @@ class CountsCfg(IntrinsicCfg):
 @dataclass(kw_only=True)
 class StableCountsCfg(CountsCfg):
     type: Literal["stable_counts"] = "stable_counts"
-    stable_dims: list[int] = MISSING  # obs indices whose norm defines "stable"
-    stable_threshold: float = MISSING  # stable iff ‖obs[:, stable_dims]‖ < this
+    stability_fn: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]] = MISSING
+    snapshot_dim: int = MISSING  # width of the env-restorable state passed to observe() - NOT inferred from obs_dim
+    count_exponent: float = 1.0  # higher prefers rarely-visited cells when archive.select()-ing reset points
     ungated_weight: float = 0.0  # >0 adds a dense visitation-novelty term (0 = pure gated)
 
 if __name__ == "__main__":
@@ -274,7 +252,51 @@ if __name__ == "__main__":
 
     # two identical obs in the same batch should each be counted
     obs = torch.tensor([[0.1, 1.5], [0.1, 1.5]])
-    counts.train_one_step(obs)
+    counts.observe(obs)
     idx = counts.grid.to_index(obs)
     assert counts.counts[idx][0] == 3, counts.counts[idx]  # started at 1, +2
     print("ok, duplicate-in-batch counting works")
+
+    # StableCounts: stability gating, dedup-on-tie, and reset sampling
+    stable_cfg = StableCountsCfg(
+        limits=[(0, 1.0), (1, 4)],
+        resolutions=[0.2, 1],
+        use_frac=1.0,
+        stability_fn=norm_threshold_stability(dims=[1], threshold=0.5),  # dim 1 here is a stand-in "velocity" dim
+        snapshot_dim=2,
+    )
+    stable_counts = StableCounts(stable_cfg, "cpu", 2)
+
+    unstable_obs = torch.tensor([[0.1, 5.0]])  # dim-1 value 5.0 way over the norm threshold
+    stable_counts.observe(unstable_obs, unstable_obs)
+    assert stable_counts.n_stable == 0, "unstable rows must never be archived"
+    rew = stable_counts.get_intrinsic_rew(unstable_obs)
+    assert rew.item() == 0.0, "unstable rows must get zero (gated) reward"
+
+    # resets are decoupled from stability: an unstable-only cell is still a valid
+    # reset target (visited), even though it's not archived (occupied/stable)
+    unstable_cell = stable_counts.archive.grid.to_flat(unstable_obs)
+    assert bool(stable_counts.archive.visited[unstable_cell])
+    assert not bool(stable_counts.archive.occupied[unstable_cell])
+    snaps, cells = stable_counts.archive.select(1)
+    assert cells.item() == unstable_cell.item()
+    assert torch.allclose(snaps[0], unstable_obs[0])
+
+    # two stable obs landing in the same cell, differing "stability" (dim-1 magnitude);
+    # the archive should keep only the more-stable (lower-magnitude) one
+    dup_obs = torch.tensor([[0.1, 0.3], [0.1, 0.1]])
+    stable_counts.observe(dup_obs, dup_obs)
+    assert stable_counts.n_stable == 1, stable_counts.n_stable
+    assert torch.allclose(stable_counts.stable_states()[0], torch.tensor([0.1, 0.1])), stable_counts.stable_states()
+
+    # select() now draws from ANY visited cell (stable or not), and is a no-op on an empty archive
+    empty_cfg = StableCountsCfg(
+        limits=[(0, 1.0)], resolutions=[0.2], use_frac=1.0,
+        stability_fn=norm_threshold_stability(dims=[0], threshold=0.0), snapshot_dim=1,
+    )
+    empty_archive = StableCounts(empty_cfg, "cpu", 1).archive
+    assert empty_archive.select(3) is None
+    snaps, cells = stable_counts.archive.select(5)
+    assert snaps.shape == (5, 2)
+    assert bool(stable_counts.archive.visited[cells].all())
+    print("ok, StableCounts gating / dedup / select-from-any-visit all check out")

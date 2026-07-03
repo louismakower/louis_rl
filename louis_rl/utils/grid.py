@@ -29,6 +29,7 @@ class CellGrid:
         self.n_cells = 1
         for n in self.shape:
             self.n_cells *= n
+        self.n_bin = len(self.shape)  # number of leading feature columns used for binning
         print(f"CellGrid shape: {self.shape} ({self.n_cells} cells)")
 
     def to_index(self, feats: torch.Tensor) -> tuple[torch.Tensor, ...]:

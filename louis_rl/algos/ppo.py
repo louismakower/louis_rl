@@ -253,7 +253,24 @@ class PPORunner(BaseRunner):
                 intrns_rew = self.intrinsic.get_intrinsic_rew(intrinsic_next_obs, update_norm_stats=True)
                 self.intrinsic_rew_buf[:, step_idx] = intrns_rew.squeeze(-1)
                 self.intrinsic_next_obs_buf[:, step_idx] = intrinsic_next_obs
-            
+
+                # observe with this step's reach before restore, so the archive never re-observes its own target
+                archive = getattr(self.intrinsic, "archive", None)
+                full_snapshot = None
+                if archive is not None:
+                    current_snapshot = self._env.snapshot_state()
+                    full_snapshot = torch.where(resetted.unsqueeze(-1), extras["terminal_snapshot"], current_snapshot)
+                self.intrinsic.observe(intrinsic_next_obs, full_snapshot)
+
+                if archive is not None and self.cfg.archive_reset_frac > 0 and resetted.any():
+                    to_restore = resetted & (torch.rand(self.num_envs, device=self.device) < self.cfg.archive_reset_frac)
+                    if to_restore.any():
+                        selected = archive.select(int(to_restore.sum()))
+                        if selected is not None:
+                            snaps, _ = selected
+                            next_obs = self._env.restore_state(env_ids=to_restore, snapshots=snaps)
+                            self.writer.add_scalar("archive/n_restored", to_restore.float().sum(), self.global_step)
+
             # handle terminal observations
             next_obs_t = self.add_goal_obs(next_obs)
             terminal_t = self.add_goal_obs(extras["terminal_obs"])
@@ -303,5 +320,6 @@ class PPORunnerCfg:
     intrinsic_v_grad_steps: int = MISSING
     intrinsic_V_lr: float = MISSING
     intrinsic_weight: float = MISSING
-    
+    archive_reset_frac: float = 0.0  # fraction of resetting envs to redirect to an archived stable state (0 = disabled; requires SnapshotVecEnv)
+
     algo_name: str = "ppo"
