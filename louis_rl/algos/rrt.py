@@ -69,7 +69,6 @@ class RRTRunner(BaseRunner):
 
     def learn(self):
         obs, extras = self._env.reset()
-        input("press enter")
         self.graph = Graph(
             root=self.obs_to_node(obs)[0], # first env is where we init the tree
             max_nodes=self.cfg.max_nodes,
