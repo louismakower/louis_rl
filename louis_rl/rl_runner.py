@@ -1,6 +1,7 @@
 from .algos.ppo import PPORunner
 from .algos.sac import SACRunner
 from .algos.rrt import RRTRunner
+from .algos.explore import ExplorerRunner
 
 class RLRunner:
     def __init__(self, env, cfg, log_dir, inference_only=False):
@@ -10,6 +11,8 @@ class RLRunner:
             self.runner = SACRunner(env, cfg, log_dir, inference_only=inference_only)
         elif cfg.algo_name.lower() == "rrt":
             self.runner = RRTRunner(env, cfg, log_dir)
+        elif cfg.algo_name.lower() == "explore":
+            self.runner = ExplorerRunner(env, cfg, log_dir)
 
     def learn(self):
         self.runner.learn()
