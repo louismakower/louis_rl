@@ -10,7 +10,7 @@ from louis_rl.utils.networks import Policy, Q
 from louis_rl.utils.reward_normaliser import RewardNormaliser
 from .base_runner import BaseRunner
 from louis_rl.utils.experience import VectorizedReplayBuffer
-from louis_rl.implementations.her import HERCfg, relabel
+from louis_rl.implementations.her import HERCfg, drop_static_episodes, relabel
 from louis_rl.implementations.goal_spec import GoalSpec, PlainSpec
 from louis_rl.vec_env import VecEnv
 from louis_rl.implementations.intrinsic import IntrinsicModule, IntrinsicCfg
@@ -280,6 +280,10 @@ class SACRunner(BaseRunner):
             t_idx = torch.arange(max_len, device=self.device).unsqueeze(1)  # (max_len, 1)
             sliced["valid"] = (t_idx < lengths.unsqueeze(0)).reshape(-1)    # (max_len * num_term,)
 
+            # deterministic, so run once rather than once per relabel pass
+            if self.her.drop_static_episodes:
+                sliced = drop_static_episodes(sliced, spec)
+
             for _ in range(self.her.k):
                 new_transitions = relabel(sliced, spec, self.her)
                 buffer_data = {
@@ -293,7 +297,9 @@ class SACRunner(BaseRunner):
                     buffer_data.update({
                         "rnd_obs": new_transitions["rnd_obs"],
                     })
-                self.buffer.add(buffer_data)
+                # relabel can return nothing (all filtered out)
+                if new_transitions["reward"].shape[0] > 0:
+                    self.buffer.add(buffer_data)
             if self.should_log and new_transitions["reward"].shape[0] != 0:
                 self.writer.add_histogram("her/distances", new_transitions["distances"], self.global_step)
                 self.writer.add_histogram("her/rewards", new_transitions["reward"], self.global_step)

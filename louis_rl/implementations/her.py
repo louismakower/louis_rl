@@ -36,7 +36,30 @@ class HERCfg:
 
     mode: str = "future"  # "final" or "future"
     k: int = 1  # relabelled passes per finished episode
-    drop_solved_starts: bool = True
+    drop_static_episodes: bool = True
+
+
+def drop_static_episodes(traj: dict, spec: GoalSpec) -> dict[str, torch.Tensor]:
+    """Discard episodes whose achieved goal never left the region it started in"""
+    achieved = traj["achieved"]  # (max_len, num_envs, goal_dim)
+    max_len, num_envs, goal_dim = achieved.shape
+    start = achieved[0].unsqueeze(0).expand_as(achieved)
+    at_start = spec.success(
+        achieved.reshape(-1, goal_dim), start.reshape(-1, goal_dim)
+    ).reshape(max_len, num_envs)  # which steps it was within goal_radius of the start
+
+    # padded steps hold stale data from the previous episode, so only real steps count
+    moved = (~at_start & traj["valid"].reshape(max_len, num_envs)).any(dim=0)
+    if bool(moved.all()):
+        return traj
+
+    lengths = traj["lengths"][moved]  # shape (n_moved,)
+    out = {k: v[:, moved] for k, v in traj.items() if k not in ("lengths", "valid")}
+    out["lengths"] = lengths
+    # max_len is left as it was; the surplus rows are simply never valid
+    t_idx = torch.arange(max_len, device=achieved.device).unsqueeze(1)  # shape (max_len, 1)
+    out["valid"] = (t_idx < lengths.unsqueeze(0)).reshape(-1)  # shape (max_len * n_moved,)
+    return out
 
 
 def relabel(traj: dict, spec: GoalSpec, cfg: HERCfg) -> dict[str, torch.Tensor]:
@@ -67,10 +90,9 @@ def relabel(traj: dict, spec: GoalSpec, cfg: HERCfg) -> dict[str, torch.Tensor]:
     flat_next_achieved = next_achieved.reshape(-1, goal_dim)
 
     reward = spec.reward(flat_next_achieved, flat_goal)
-    success = spec.success(flat_next_achieved, flat_goal)
     distance = spec.distance(flat_next_achieved, flat_goal)
 
-    done = success if spec.terminate_on_success else traj["term"].reshape(-1)
+    done = traj["term"].reshape(-1)  # TODO: handle resets if resetting on success
 
     out = {
         "obs": obs.reshape(-1, obs.shape[-1])[valid],
@@ -80,4 +102,9 @@ def relabel(traj: dict, spec: GoalSpec, cfg: HERCfg) -> dict[str, torch.Tensor]:
         "done": done.reshape(-1, 1)[valid],
         "distances": distance.reshape(-1)[valid],
     }
+    if "rnd_obs" in traj:
+        # the intrinsic reward is a property of the state, not of the goal, so it rides
+        # along unchanged - but it has to ride along, or the buffer add loses a column
+        rnd_obs = traj["rnd_obs"]
+        out["rnd_obs"] = rnd_obs.reshape(-1, rnd_obs.shape[-1])[valid]
     return out

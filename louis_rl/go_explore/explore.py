@@ -5,7 +5,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from louis_rl.vec_env import VecEnv
 from louis_rl.utils.grid import CellGrid
-from .base_runner import BaseRunner
+from louis_rl.algos.base_runner import BaseRunner
 
 
 class ExplorerRunner(BaseRunner):

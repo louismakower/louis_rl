@@ -31,7 +31,6 @@ class GoalSpec(ABC):
 
     goal_dim: int
     context_dim: int
-    terminate_on_success: bool = True
 
     @abstractmethod
     def context(self, obs: dict) -> torch.Tensor:
@@ -113,7 +112,6 @@ class PlainSpec(GoalSpec):
     """
 
     goal_dim = 0
-    terminate_on_success = False
 
     def __init__(self, observation_space: dict):
         self.context_keys = [k for k in observation_space if "policy" in k]

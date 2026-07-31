@@ -1,7 +1,8 @@
 from .algos.ppo import PPORunner
 from .algos.sac import SACRunner
 from .algos.rrt import RRTRunner
-from .algos.explore import ExplorerRunner
+from .go_explore.explore import ExplorerRunner
+from .go_explore.reach import make_reach_runner
 
 class RLRunner:
     def __init__(self, env, cfg, log_dir, inference_only=False):
@@ -13,6 +14,10 @@ class RLRunner:
             self.runner = RRTRunner(env, cfg, log_dir)
         elif cfg.algo_name.lower() == "explore":
             self.runner = ExplorerRunner(env, cfg, log_dir)
+        elif cfg.algo_name.lower() == "reach":
+            self.runner = make_reach_runner(env, cfg, log_dir, inference_only=inference_only)
+        else:
+            raise ValueError(f"Unknown algo_name {cfg.algo_name!r}")
 
     def learn(self):
         self.runner.learn()
