@@ -10,7 +10,8 @@ from louis_rl.utils.networks import Policy, Q
 from louis_rl.utils.reward_normaliser import RewardNormaliser
 from .base_runner import BaseRunner
 from louis_rl.utils.experience import VectorizedReplayBuffer
-from louis_rl.implementations.her import HERCfg
+from louis_rl.implementations.her import HERCfg, relabel
+from louis_rl.implementations.goal_spec import GoalSpec, PlainSpec
 from louis_rl.vec_env import VecEnv
 from louis_rl.implementations.intrinsic import IntrinsicModule, IntrinsicCfg
 
@@ -59,11 +60,7 @@ class SACRunner(BaseRunner):
             return
 
         # HER
-        if self.cfg.her_cfg:
-            self.her = cfg.her_cfg
-            self.her.policy_obs_dim = self.policy_obs_dim
-        else:
-            self.her = None
+        self.her = cfg.her_cfg if cfg.her_cfg else None
         
         # RND
         if self.cfg.use_intrinsic:
@@ -102,13 +99,8 @@ class SACRunner(BaseRunner):
         print(f"[INFO]: UTD ratio is currently: {utd:.3f}")
 
     def _init_obs(self):
-        self.policy_obs_dim = sum(
-            self._env.observation_space[k].shape[0]
-            for k in self._env.observation_space if "policy" in k
-        )
-        goal_obs = self._env.observation_space.get("goal")
-        goal_obs_dim = sum(goal_obs[k].shape[0] for k in goal_obs) if goal_obs else 0
-        self.obs_shape = self.policy_obs_dim + goal_obs_dim
+        self.spec: GoalSpec = self.cfg.goal_spec or PlainSpec(self._env.observation_space)
+        self.obs_shape = self.spec.obs_dim
         self.obs_norm = RunningMeanStd(insize=(self.obs_shape,)).to(self._env.device)
 
     def _set_eval(self):
@@ -146,7 +138,7 @@ class SACRunner(BaseRunner):
 
     def get_deterministic_action(self, obs):
         self._set_eval()
-        obs = self.add_goal_obs(obs)
+        obs = self.spec.encode_obs(obs)
         obs_n = self.obs_norm(obs)
         mu, _ = self.policy.network(obs_n).chunk(2, dim=-1)
         return torch.tanh(mu)
@@ -154,7 +146,7 @@ class SACRunner(BaseRunner):
     def rollout_and_add_to_buffer(self, obs, ep_infos):
         self._set_eval()
         for step in range(self.cfg.steps_per_iter):
-            obs_t = self.add_goal_obs(obs)
+            obs_t = self.spec.encode_obs(obs)
             if self.warmup:
                 action = (torch.rand(size=(obs_t.shape[0], self.action_shape), device=self.device) * 2) - 1
             else:
@@ -166,8 +158,8 @@ class SACRunner(BaseRunner):
                 obs = _recurse_obs(obs, fn=lambda v: v.unsqueeze(-1) if v.dim() == 1 else v)
                 next_obs = _recurse_obs(next_obs, fn=lambda v: v.unsqueeze(-1) if v.dim() == 1 else v)
 
-            next_obs_t = self.add_goal_obs(next_obs)
-            terminal_t = self.add_goal_obs(extras["terminal_obs"])  # (N, obs_dim), nan for non-reset
+            next_obs_t = self.spec.encode_obs(next_obs)
+            terminal_t = self.spec.encode_obs(extras["terminal_obs"])  # (N, obs_dim), nan for non-reset
 
             # for resets, use the terminal obs rather than next_obs so we bootstrap
             # off the correct obs, rather than an uncorrelated random reset state
@@ -231,9 +223,7 @@ class SACRunner(BaseRunner):
             if self.her:
                 self.get_her_and_add_to_buffer(
                     obs=obs,
-                    obs_t=obs_t,
                     next_obs=next_obs,
-                    next_obs_for_buffer=next_obs_for_buffer,
                     action=action,
                     term=term,
                     resetted=resetted,
@@ -253,60 +243,45 @@ class SACRunner(BaseRunner):
     def get_her_and_add_to_buffer(
             self,
             obs,
-            obs_t,
             next_obs,
-            next_obs_for_buffer,
             action,
             term,
             resetted,
             extras,
             intrinsic_obs,
     ):
-        if self.her.her_obs_buf is None:
-            self._init_her_obs_buf(obs["her"])
+        spec, traj, ptr = self.spec, self.her_traj, self.her_ep_ptr
 
-        ptr = self.her.ep_ptr
-        self.her.trajectories["obs"][ptr, self.env_arange] = obs_t
-        self.her.trajectories["action"][ptr, self.env_arange] = action
-        self.her.trajectories["next_obs"][ptr, self.env_arange] = next_obs_for_buffer
-        self.her.trajectories["term"][ptr, self.env_arange] = term.unsqueeze(1)
-        for key, val in obs["her"].items():
-            self.her.her_obs_buf[key][ptr, self.env_arange] = val
+        # store the goal-independent context and the achieved goal, never an encoded
+        # observation: relabelling re-encodes rather than splicing a flat obs
+        traj["context"][ptr, self.env_arange] = spec.context(obs)
+        traj["achieved"][ptr, self.env_arange] = spec.achieved(obs)
+        traj["action"][ptr, self.env_arange] = action
+        traj["term"][ptr, self.env_arange] = term
         if self.intrinsic:
-            self.her.trajectories["rnd_obs"][ptr, self.env_arange] = intrinsic_obs
+            traj["rnd_obs"][ptr, self.env_arange] = intrinsic_obs
 
-        # fill next_her_obs: use terminal_obs for reset envs, next_obs for others
-        for key, val in next_obs["her"].items():
-            term_her = extras["terminal_obs"]["her"][key]  # (N, ...), nan for non-reset
-            next_her = val.clone()
-            if resetted.any():
-                next_her[resetted] = term_her[resetted]
-            self.her.her_next_obs_buf[key][ptr, self.env_arange] = next_her
+        # for envs that reset this step, the real successor is the pre-reset state
+        next_context = spec.context(next_obs).clone()
+        next_achieved = spec.achieved(next_obs).clone()
+        if resetted.any():
+            next_context[resetted] = spec.context(extras["terminal_obs"])[resetted]
+            next_achieved[resetted] = spec.achieved(extras["terminal_obs"])[resetted]
+        traj["next_context"][ptr, self.env_arange] = next_context
+        traj["next_achieved"][ptr, self.env_arange] = next_achieved
 
         if resetted.any():
             term_envs = resetted.nonzero(as_tuple=False).squeeze(-1)
-            lengths = self.her.ep_ptr[term_envs] + 1  # (num_term,) +1: ep_ptr is 0-indexed
-            max_len = lengths.max().item()
+            lengths = ptr[term_envs] + 1  # (num_term,) +1: ep_ptr is 0-indexed
+            max_len = int(lengths.max())
 
-            sliced = {
-                "obs": self.her.trajectories["obs"][:max_len, term_envs],
-                "action": self.her.trajectories["action"][:max_len, term_envs],
-                "next_obs": self.her.trajectories["next_obs"][:max_len, term_envs],
-                "term": self.her.trajectories["term"][:max_len, term_envs],
-                "her_obs": {k: self.her.her_obs_buf[k][:max_len, term_envs] for k in self.her.her_obs_buf},
-                "her_next_obs": {k: self.her.her_next_obs_buf[k][:max_len, term_envs] for k in self.her.her_next_obs_buf},
-                "lengths": lengths,
-            }
-            if self.intrinsic:
-                sliced.update({
-                    "rnd_obs": self.her.trajectories["rnd_obs"][:max_len, term_envs],
-                })
-
+            sliced = {k: v[:max_len, term_envs] for k, v in traj.items()}
+            sliced["lengths"] = lengths
             t_idx = torch.arange(max_len, device=self.device).unsqueeze(1)  # (max_len, 1)
             sliced["valid"] = (t_idx < lengths.unsqueeze(0)).reshape(-1)    # (max_len * num_term,)
 
-            for _ in range(self.cfg.her_cfg.k):
-                new_transitions = self.her.get_hindsight_transitions(sliced, extras={"policy_obs_dim": self.policy_obs_dim})
+            for _ in range(self.her.k):
+                new_transitions = relabel(sliced, spec, self.her)
                 buffer_data = {
                     "obs": new_transitions["obs"],
                     "action": new_transitions["action"],
@@ -324,11 +299,7 @@ class SACRunner(BaseRunner):
                 self.writer.add_histogram("her/rewards", new_transitions["reward"], self.global_step)
                 self.writer.add_scalar("her/her_ave_rew", new_transitions["reward"].mean(), self.global_step)
 
-        self.her.ep_ptr = torch.where(
-            resetted,
-            torch.zeros_like(self.her.ep_ptr),
-            self.her.ep_ptr + 1,
-        )
+        self.her_ep_ptr = torch.where(resetted, torch.zeros_like(ptr), ptr + 1)
 
     def train_batch(self, log: bool = True):
         sample = self.buffer.sample(self.cfg.batch_size)
@@ -542,34 +513,25 @@ class SACRunner(BaseRunner):
             return
         self.buffer = self._init_buffer()
         if self.her:
-            self.her.trajectories, self.her.ep_ptr = self._init_her()
-            self.her.her_obs_buf = None
+            self.her_traj, self.her_ep_ptr = self._init_her()
 
     def _init_her(self):
+        def zeros(dim, dtype=torch.float32):
+            return torch.zeros(self.max_ep_len, self.num_envs, dim, device=self.device, dtype=dtype)
+
+        spec = self.spec
         her_trajectories = {
-            "obs": torch.zeros(self.max_ep_len, self.num_envs, self.obs_shape, device=self.device),
-            "action": torch.zeros(self.max_ep_len, self.num_envs, self.action_shape, device=self.device),
-            "next_obs": torch.zeros(self.max_ep_len, self.num_envs, self.obs_shape, device=self.device),
-            "term": torch.zeros(self.max_ep_len, self.num_envs, 1, dtype=torch.bool, device=self.device),
+            "context": zeros(spec.context_dim),
+            "next_context": zeros(spec.context_dim),
+            "achieved": zeros(spec.goal_dim),
+            "next_achieved": zeros(spec.goal_dim),
+            "action": zeros(self.action_shape),
+            "term": torch.zeros(self.max_ep_len, self.num_envs, dtype=torch.bool, device=self.device),
         }
         if self.intrinsic:
-            her_trajectories.update({
-                "rnd_obs": torch.zeros(self.max_ep_len, self.num_envs, self.intrinsic_obs_shape, device=self.device)
-            })
+            her_trajectories["rnd_obs"] = zeros(self.intrinsic_obs_shape)
         ep_ptr = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         return her_trajectories, ep_ptr
-
-    def _init_her_obs_buf(self, her_obs):
-        self.her.her_obs_buf = {}
-        self.her.her_next_obs_buf = {}
-        for key, val in her_obs.items():
-            shape = val.shape[1:]
-            self.her.her_obs_buf[key] = torch.zeros(
-                self.max_ep_len, self.num_envs, *shape, device=self.device, dtype=val.dtype
-            )
-            self.her.her_next_obs_buf[key] = torch.zeros(
-                self.max_ep_len, self.num_envs, *shape, device=self.device, dtype=val.dtype
-            )
 
     def _init_q(self):
         in_size = self.action_shape + self.obs_shape
@@ -671,6 +633,8 @@ class SACRunnerCfg:
     reward_clip: float = MISSING  # 0.0 = disabled
     reward_norm_type: str = "mean"  # mean or ema
     reward_ema_param: float | None = None
+
+    goal_spec: GoalSpec | None = None
 
     # HER
     her_cfg: HERCfg | None = None

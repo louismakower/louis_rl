@@ -23,5 +23,5 @@ class RLRunner:
     def get_deterministic_action(self, obs):
         return self.runner.get_deterministic_action(obs)
     
-    def add_goal_obs(self, obs):
-        return self.runner.add_goal_obs(obs)
+    def encode_obs(self, obs):
+        return self.runner.spec.encode_obs(obs)

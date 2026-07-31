@@ -10,6 +10,7 @@ from .base_runner import BaseRunner
 from louis_rl.vec_env import VecEnv
 from louis_rl.utils.networks import build_mlp
 from louis_rl.implementations.intrinsic import IntrinsicCfg, IntrinsicModule
+from louis_rl.implementations.goal_spec import GoalSpec, PlainSpec
 
 class PPORunner(BaseRunner):
     def __init__(
@@ -66,13 +67,8 @@ class PPORunner(BaseRunner):
             self.intrinsic_next_obs_buf = None
 
     def _init_obs(self):
-        self.policy_obs_dim = sum(
-            self._env.observation_space[k].shape[0]
-            for k in self._env.observation_space if "policy" in k
-        )
-        goal_obs = self._env.observation_space.get("goal")
-        goal_obs_dim = sum(goal_obs[k].shape[0] for k in goal_obs) if goal_obs else 0
-        self.obs_shape = self.policy_obs_dim + goal_obs_dim
+        self.spec: GoalSpec = self.cfg.goal_spec or PlainSpec(self._env.observation_space)
+        self.obs_shape = self.spec.obs_dim
 
     def _init_networks(self):
         self.policy = build_mlp(
@@ -138,7 +134,7 @@ class PPORunner(BaseRunner):
 
     def get_deterministic_action(self, obs):
         self.policy.eval()
-        obs = self.add_goal_obs(obs)
+        obs = self.spec.encode_obs(obs)
         return self.policy(obs)
 
     def get_log_prob(self, obs, act):
@@ -239,7 +235,7 @@ class PPORunner(BaseRunner):
         ep_infos = []
         for step_idx in range(self.cfg.steps_per_rollout):
             if isinstance(obs, dict):
-                obs = self.add_goal_obs(obs)
+                obs = self.spec.encode_obs(obs)
             with torch.no_grad():
                 act, log_prob = self.get_action(obs)
             next_obs, rew, term, timeout, extras = self._env.step(act)
@@ -272,8 +268,8 @@ class PPORunner(BaseRunner):
                             self.writer.add_scalar("archive/n_restored", to_restore.float().sum(), self.global_step)
 
             # handle terminal observations
-            next_obs_t = self.add_goal_obs(next_obs)
-            terminal_t = self.add_goal_obs(extras["terminal_obs"])
+            next_obs_t = self.spec.encode_obs(next_obs)
+            terminal_t = self.spec.encode_obs(extras["terminal_obs"])
             next_obs_for_buf = torch.where(resetted.unsqueeze(-1), terminal_t, next_obs_t)
 
             self.obs_buf[:, step_idx] = obs
@@ -312,7 +308,7 @@ class PPORunnerCfg:
     eps: float = MISSING
 
     save_interval: int = MISSING
-    
+
     # RND
     intrinsic: None | IntrinsicCfg = MISSING
     intrinsic_V_hidden_layers: list[int] = MISSING
@@ -321,5 +317,7 @@ class PPORunnerCfg:
     intrinsic_V_lr: float = MISSING
     intrinsic_weight: float = MISSING
     archive_reset_frac: float = 0.0  # fraction of resetting envs to redirect to an archived stable state (0 = disabled; requires SnapshotVecEnv)
+
+    goal_spec: GoalSpec | None = None
 
     algo_name: str = "ppo"
